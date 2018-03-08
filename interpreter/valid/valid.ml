@@ -502,6 +502,24 @@ let create_cfg (bbs: bb_node list) : cfg =
       | Some (_, fallthru) -> (bb_id, fallthru.bb_id) :: acc'
       end
 
+    (* the next two blocks should be the then/else branches of this
+     * conditional. we need to add edges from this block to the first
+     * blocks there *)
+    | If _ ->
+      begin match ctx.right with
+      | (Control (CtrlIf, bt::bts))::(Control (CtrlIf, be::bes))::_ ->
+        let then_ctx = { zipper=[]; left=[]; right=bts; focus=bt } in
+        let else_ctx = { zipper=[]; left=[]; right=bes; focus=be } in
+        begin match (find_block then_ctx, find_block else_ctx) with
+        | (Some (_,tblock), Some (_,eblock)) ->
+          (bb_id, tblock.bb_id)::(bb_id, eblock.bb_id)::acc
+
+        | _ -> error no_region "blocks of then/else branches not found!"
+        end
+
+      | _ -> error no_region "then/else branches of conditional not found!"
+      end
+
     (* regular instruction; do nothing *)
     | _ -> acc
   in
