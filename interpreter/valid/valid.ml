@@ -305,6 +305,249 @@ and check_block (c : context) (es : instr list) (ts : stack_type) at =
      " but stack has " ^ string_of_infer_types (snd s))
 
 
+(* iTalX *)
+(* to adapt the inference algorithm, we need to compute a CFG,
+ * which is a bit tricky because of wasm's structured control structures.
+ *)
+type basic_block = { bb_id: int; instrs: instr list; }
+
+(* we need to create a tree of basic blocks to
+ * resolve branch targets correctly *)
+type ctrl_type = CtrlBlock | CtrlLoop | CtrlIf
+type bb_node =
+  | NodeBlock of basic_block 
+  | Control of ctrl_type * (bb_node list)
+
+type bb_edge = int * int
+type cfg = { blocks: basic_block list; edges: bb_edge list; }
+
+(* create tree of basic blocks *)
+let create_bb_tree (is: instr list) : bb_node list =
+  let rec create_bb_tree' (n: int ref) (is: instr list) : bb_node list =
+    let add_to_current_block (i: instr) (blocks: bb_node list) = 
+      match blocks with
+      | (NodeBlock b)::bs -> (NodeBlock { b with instrs=b.instrs@[i] }) :: bs
+      | _ ->
+        let blocks' = (NodeBlock { bb_id=(!n); instrs=[i]; }) :: blocks in
+        n := !n + 1;
+        blocks'
+    in
+    let process_instr (i: instr) (acc: bb_node list) =
+      match i.it with
+      (* branch / exception *)
+      | Br _ | BrIf _ | Unreachable | Return | Call _ | CallIndirect _ ->
+        let acc'  = add_to_current_block i acc in
+        let acc'' = (NodeBlock { bb_id=(!n); instrs=[] }) :: acc' in
+        n := !n + 1;
+        acc''
+
+      (* control structure *)
+      | Block (_, binstrs) ->
+        (Control (CtrlBlock, create_bb_tree' n binstrs)) :: acc
+
+      | Loop (_, binstrs) ->
+        (Control (CtrlLoop, create_bb_tree' n binstrs)) :: acc
+
+      | If (_, tinstrs, einstrs) ->
+        (* we split up the branches into separate Control subtrees
+         * to prevent accidentally adding spurious edges to the CFG
+         * e.g. a br_if instruction at the end of the then branch will fall thru
+         * to the else branch if both were in the same control subtree *)
+        let acc'      = add_to_current_block i acc in
+        let then_ctrl = Control (CtrlIf, create_bb_tree' n tinstrs) in
+        let else_ctrl = Control (CtrlIf, create_bb_tree' n einstrs) in
+        let acc''     = else_ctrl :: then_ctrl :: acc' in
+        acc''
+
+      (* regular instruction; add to current basic block *)
+      | _ -> add_to_current_block i acc
+    in
+    List.fold_right process_instr is []
+  in
+  let rec remove_empty_blocks (blocks: bb_node list) =
+    let remove_empty_block (block: bb_node) : bb_node list =
+      match block with
+      | Control (ctrl_label, ctrl_blocks) ->
+        let ctrl_blocks' = remove_empty_blocks ctrl_blocks in
+        [Control (ctrl_label, ctrl_blocks')]
+
+      | NodeBlock { instrs=[]; _ } -> []
+
+      | _ -> [block]
+    in
+    List.concat (List.map remove_empty_block blocks)
+  in
+  let n = ref 0 in
+  let tree  = create_bb_tree' n is in
+  let tree' = remove_empty_blocks tree in
+  tree'
+;;
+
+type bb_zipper = {
+  left: bb_node list;
+  right: bb_node list;
+  ctrl: ctrl_type;
+}
+type bb_ctx = {
+  zipper: bb_zipper list;
+  left: bb_node list;
+  right: bb_node list;
+  focus: bb_node;
+}
+
+(* pop out of the current context *)
+let focus_up (ctx: bb_ctx) =
+  match ctx.zipper with
+  | [] -> error no_region "no context to pop out of!"
+  | z::zs ->
+    let blocks = (List.rev ctx.left) @ [ctx.focus] @ (ctx.right) in
+    let node = Control (z.ctrl, blocks) in
+    let ctx' = { zipper=zs; left=z.left; right=z.right; focus=node; } in
+    ctx'
+;;
+
+(* push into the current context *)
+let focus_down (ctx: bb_ctx) =
+  match ctx.focus with
+  | NodeBlock _ | Control (_, []) ->
+    error no_region "no focused context to push into!"
+
+  | Control (ctrl_label, cb::cbs) ->
+    let z = { left=ctx.left; right=ctx.right; ctrl=ctrl_label } in
+    let ctx' = { zipper=z::ctx.zipper; left=[]; right=cbs; focus=cb } in
+    ctx'
+;;
+
+(* focus on the next part of the bb_tree, if there is any *)
+let rec focus_next (ctx: bb_ctx) =
+  match ctx.right with
+  | [] ->
+    begin match ctx.zipper with
+    (* nothing else to process! *)
+    | [] -> None
+
+    (* finished processing this block; pop out into the outer block and
+     * continue processing there *)
+    | _ ->
+      ctx |> focus_up |> focus_next
+    end
+
+  | b::bs ->
+    Some { ctx with left=ctx.focus::ctx.left; right=bs; focus=b; }
+;;
+
+(* add edges between basic blocks *)
+let create_cfg (bbs: bb_node list) : cfg =
+  (* finds the next basic block. if the focus is already a basic block, then
+   * this function returns the context unchanged *)
+  let rec find_block (ctx: bb_ctx) =
+    match ctx.focus with
+    | NodeBlock block -> Some (ctx, block)
+    | Control (_, []) ->
+      begin match focus_next ctx with
+      | None -> None
+      | Some ctx' -> find_block ctx'
+      end
+
+    | _ -> ctx |> focus_down |> find_block
+  in
+  (* like find block, except it ignores the current focus *)
+  let find_next_block (ctx: bb_ctx) =
+    match ctx.focus with
+    | Control (_, _::_) -> ctx |> focus_down |> find_block
+    | _ ->
+      begin match focus_next ctx with
+      | None -> None
+      | Some ctx' -> find_block ctx'
+      end
+  in
+  let rec compute_branch_target (level: int) (ctx: bb_ctx) =
+    match (level, ctx.zipper) with
+    | (0, z::_)  ->
+      let traverse =
+        match z.ctrl with
+        (* the first basic block AFTER this context is the branch target *)
+        | CtrlBlock | CtrlIf ->
+          ctx |> focus_up |> find_next_block
+
+        (* the first basic block from this context is the branch target *)
+        | CtrlLoop ->
+          ctx |> focus_up |> focus_down |> find_block
+      in
+      begin match traverse with
+      | None -> error no_region "could not find branch target"
+      | Some (_, block) -> block.bb_id
+      end
+
+    | (n, _::_)  ->
+      ctx |> focus_up |> compute_branch_target (n-1)
+
+    | (_, [])     -> error no_region "branch target not in scope"
+  in
+  let process_instr (ctx: bb_ctx) (bb_id: int) (i: instr) (acc: bb_edge list) =
+    match i.it with
+    | Br target ->
+      let target_id = compute_branch_target (Int32.to_int target.it) ctx in
+      (bb_id, target_id)::acc
+
+    (* like branch, but this has a fallthrough edge to the next block *)
+    | BrIf target ->
+      let target_id = compute_branch_target (Int32.to_int target.it) ctx in
+      let acc' = (bb_id, target_id)::acc in
+      begin match find_next_block ctx with
+      (* there is no next block; this block doesn't fallthrough anywhere *)
+      | None -> acc'
+
+      (* there is a fallthrough block *)
+      | Some (_, fallthru) -> (bb_id, fallthru.bb_id) :: acc'
+      end
+
+    (* regular instruction; do nothing *)
+    | _ -> acc
+  in
+  let process_block (ctx: bb_ctx) (b: basic_block) =
+    List.fold_right (process_instr ctx b.bb_id) b.instrs []
+  in
+  let rec create_cfg' (ctx: bb_ctx) =
+    let process_next cur_edges =
+      match focus_next ctx with
+      | None -> cur_edges
+      | Some ctx' ->
+        let rest = create_cfg' ctx' in
+        cur_edges @ rest
+    in 
+    match ctx.focus with
+    | NodeBlock block ->
+      let block_edges = process_block ctx block in
+      process_next block_edges
+
+    | Control _ -> error no_region "context is not focused on node block!"
+  in
+  let rec get_basic_blocks (blocks: bb_node list) =
+    let get_basic_block (block: bb_node) =
+      match block with
+      | NodeBlock block -> [block]
+      | Control (_, ctrl_blocks) -> get_basic_blocks ctrl_blocks
+    in
+    List.concat (List.map get_basic_block blocks)
+  in
+  match bbs with
+  | [] -> { blocks=[]; edges=[] }
+  | b::bs ->
+    (* have a fake bb as the focus and let focus_next find the actual bb
+     * to be the initial focus *)
+    let ctx = { zipper=[]; left=[]; right=bs; focus=b; } in
+    begin match find_block ctx with
+    | Some (ctx', _) ->
+      let blocks  = get_basic_blocks bbs in
+      let edges   = create_cfg' ctx' in
+      { blocks; edges; }
+
+    | None -> error no_region "no basic block found!"
+    end
+;;
+
+
 (* Types *)
 
 let check_limits {min; max} at =

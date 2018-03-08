@@ -1,5 +1,18 @@
 (* Types *)
 
+(* type constructors *)
+type ty_con =
+  | TyVar of string
+  | TyName of string
+  | TyFunc of string * (ty_con list)
+
+(* subtyping constraints *)
+type ty_constr =
+  | Subtype of ty_con * ty_con
+
+type constrained_type =
+  | ConstrainedType of (ty_constr list) * ty_con
+
 type value_type = I32Type | I64Type | F32Type | F64Type
 type elem_type = AnyFuncType
 type stack_type = value_type list
