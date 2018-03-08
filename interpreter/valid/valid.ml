@@ -534,8 +534,6 @@ let create_cfg (bbs: bb_node list) : cfg =
   match bbs with
   | [] -> { blocks=[]; edges=[] }
   | b::bs ->
-    (* have a fake bb as the focus and let focus_next find the actual bb
-     * to be the initial focus *)
     let ctx = { zipper=[]; left=[]; right=bs; focus=b; } in
     begin match find_block ctx with
     | Some (ctx', _) ->
