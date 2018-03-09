@@ -321,6 +321,37 @@ type bb_node =
 type bb_edge = int * int
 type cfg = { blocks: basic_block list; edges: bb_edge list; }
 
+let print_instrs (instrs: instr list) =
+  List.iter begin fun i ->
+    Printf.printf "%s\n" (Arrange.instr i |> Sexpr.to_string_mach 0)
+  end instrs
+
+let rec print_bb_tree ?(indent=0) (bb_tree: bb_node list) =
+  let print_ctrl_label = function
+    | CtrlBlock -> "block" | CtrlLoop -> "loop" | CtrlIf -> "if"
+  in
+  let print_block block =
+    List.iter begin fun instr ->
+      Printf.printf "%s%s\n" (String.make (indent+2) ' ') (Arrange.instr instr |> Sexpr.to_string_mach 0)
+    end block.instrs
+  in
+  List.iter begin fun bb_node ->
+    match bb_node with
+    | NodeBlock block ->
+      Printf.printf "%sBasicBlock %d\n" (String.make indent ' ') block.bb_id;
+      print_block block
+
+    | Control (ctrl_label, ctrl_block) ->
+      Printf.printf "%sControl: %s\n" (String.make indent ' ') (print_ctrl_label ctrl_label);
+      print_bb_tree ctrl_block ~indent:(indent+2)
+
+  end bb_tree
+
+let print_cfg (cfg: cfg) = 
+  List.iter begin fun (s,t) ->
+    Printf.printf "(%d, %d)\n" s t;
+  end cfg.edges
+
 (* create tree of basic blocks *)
 let create_bb_tree (is: instr list) : bb_node list =
   let rec create_bb_tree' (n: int ref) (is: instr list) : bb_node list =
@@ -332,10 +363,11 @@ let create_bb_tree (is: instr list) : bb_node list =
         n := !n + 1;
         blocks'
     in
-    let process_instr (i: instr) (acc: bb_node list) =
+    let process_instr (acc: bb_node list) (i: instr) =
       match i.it with
       (* branch / exception *)
-      | Br _ | BrIf _ | Unreachable | Return | Call _ | CallIndirect _ ->
+      | Br _ | BrIf _ | BrTable _ | Unreachable | Return
+      | Call _ | CallIndirect _ ->
         let acc'  = add_to_current_block i acc in
         let acc'' = (NodeBlock { bb_id=(!n); instrs=[] }) :: acc' in
         n := !n + 1;
@@ -355,14 +387,19 @@ let create_bb_tree (is: instr list) : bb_node list =
          * to the else branch if both were in the same control subtree *)
         let acc'      = add_to_current_block i acc in
         let then_ctrl = Control (CtrlIf, create_bb_tree' n tinstrs) in
-        let else_ctrl = Control (CtrlIf, create_bb_tree' n einstrs) in
-        let acc''     = else_ctrl :: then_ctrl :: acc' in
-        acc''
+        let acc''     = then_ctrl::acc' in
+        begin match einstrs with
+        | [] -> acc''
+        | _ ->
+          let else_ctrl = Control (CtrlIf, create_bb_tree' n einstrs) in
+          let acc'''    = else_ctrl :: acc'' in
+          acc'''
+        end
 
       (* regular instruction; add to current basic block *)
       | _ -> add_to_current_block i acc
     in
-    List.fold_right process_instr is []
+    List.fold_left process_instr [] is |> List.rev
   in
   let rec remove_empty_blocks (blocks: bb_node list) =
     let remove_empty_block (block: bb_node) : bb_node list =
@@ -377,7 +414,7 @@ let create_bb_tree (is: instr list) : bb_node list =
     in
     List.concat (List.map remove_empty_block blocks)
   in
-  let n = ref 0 in
+  let n = ref 1 in
   let tree  = create_bb_tree' n is in
   let tree' = remove_empty_blocks tree in
   tree'
@@ -443,40 +480,34 @@ let create_cfg (bbs: bb_node list) : cfg =
   let rec find_block (ctx: bb_ctx) =
     match ctx.focus with
     | NodeBlock block -> Some (ctx, block)
-    | Control (_, []) ->
+
+    (* don't go into then/else blocks of conditionals *)
+    | Control (_, []) | Control (CtrlIf, _) ->
       begin match focus_next ctx with
       | None -> None
       | Some ctx' -> find_block ctx'
       end
 
-    | _ -> ctx |> focus_down |> find_block
+    | Control (CtrlBlock, _) | Control (CtrlLoop, _) ->
+      ctx |> focus_down |> find_block
   in
   (* like find block, except it ignores the current focus *)
   let find_next_block (ctx: bb_ctx) =
-    match ctx.focus with
-    | Control (_, _::_) -> ctx |> focus_down |> find_block
-    | _ ->
-      begin match focus_next ctx with
-      | None -> None
-      | Some ctx' -> find_block ctx'
-      end
+    match focus_next ctx with
+    | None -> None
+    | Some ctx' -> find_block ctx'
   in
   let rec compute_branch_target (level: int) (ctx: bb_ctx) =
     match (level, ctx.zipper) with
     | (0, z::_)  ->
-      let traverse =
-        match z.ctrl with
-        (* the first basic block AFTER this context is the branch target *)
-        | CtrlBlock | CtrlIf ->
-          ctx |> focus_up |> find_next_block
+      begin match z.ctrl with
+      (* the first basic block AFTER this context is the branch target *)
+      | CtrlBlock | CtrlIf ->
+        ctx |> focus_up |> find_next_block
 
-        (* the first basic block from this context is the branch target *)
-        | CtrlLoop ->
-          ctx |> focus_up |> focus_down |> find_block
-      in
-      begin match traverse with
-      | None -> error no_region "could not find branch target"
-      | Some (_, block) -> block.bb_id
+      (* the first basic block from this context is the branch target *)
+      | CtrlLoop ->
+        ctx |> focus_up |> focus_down |> find_block
       end
 
     | (n, _::_)  ->
@@ -485,15 +516,21 @@ let create_cfg (bbs: bb_node list) : cfg =
     | (_, [])     -> error no_region "branch target not in scope"
   in
   let process_instr (ctx: bb_ctx) (bb_id: int) (i: instr) (acc: bb_edge list) =
+    let add_target_edge edges target =
+      match compute_branch_target (Int32.to_int target.it) ctx with
+      | Some (_, target) -> (bb_id, target.bb_id)::edges
+      | None -> edges
+    in
     match i.it with
-    | Br target ->
-      let target_id = compute_branch_target (Int32.to_int target.it) ctx in
-      (bb_id, target_id)::acc
+    | Br target -> add_target_edge acc target
 
     (* like branch, but this has a fallthrough edge to the next block *)
     | BrIf target ->
-      let target_id = compute_branch_target (Int32.to_int target.it) ctx in
-      let acc' = (bb_id, target_id)::acc in
+      let acc' =
+        match compute_branch_target (Int32.to_int target.it) ctx with
+        | Some (_, target) -> (bb_id, target.bb_id)::acc 
+        | None -> acc
+      in
       begin match find_next_block ctx with
       (* there is no next block; this block doesn't fallthrough anywhere *)
       | None -> acc'
@@ -502,22 +539,38 @@ let create_cfg (bbs: bb_node list) : cfg =
       | Some (_, fallthru) -> (bb_id, fallthru.bb_id) :: acc'
       end
 
+    (* like branch, but there's a list of targets instead of just one *)
+    | BrTable (br_targets, def) ->
+      let targets = def::br_targets in  
+      List.fold_left add_target_edge acc targets
+
     (* the next two blocks should be the then/else branches of this
      * conditional. we need to add edges from this block to the first
      * blocks there *)
     | If _ ->
       begin match ctx.right with
-      | (Control (CtrlIf, bt::bts))::(Control (CtrlIf, be::bes))::_ ->
+      | (Control (CtrlIf, bt::bts))::tlright ->
         let then_ctx = { zipper=[]; left=[]; right=bts; focus=bt } in
-        let else_ctx = { zipper=[]; left=[]; right=bes; focus=be } in
-        begin match (find_block then_ctx, find_block else_ctx) with
-        | (Some (_,tblock), Some (_,eblock)) ->
-          (bb_id, tblock.bb_id)::(bb_id, eblock.bb_id)::acc
+        let acc' =
+          match find_block then_ctx with
+          | Some (_,tblock) -> (bb_id, tblock.bb_id)::acc
+          | _ -> error no_region "blocks of then branch not found!"
+        in
+        (* add edge to else block, if it exists *)
+        let acc'' =
+          match tlright with
+          | (Control (CtrlIf, be::bes))::_ ->
+            let else_ctx = { zipper=[]; left=[]; right=bes; focus=be } in
+            begin match find_block else_ctx with
+            | Some (_,eblock) -> (bb_id, eblock.bb_id)::acc'
+            | _ -> error no_region "blocks of else branch not found!"
+            end
 
-        | _ -> error no_region "blocks of then/else branches not found!"
-        end
+          | _ -> acc'
+        in
+        acc''
 
-      | _ -> error no_region "then/else branches of conditional not found!"
+      | _ -> error no_region "then branch of conditional not found!"
       end
 
     (* regular instruction; do nothing *)
@@ -528,9 +581,9 @@ let create_cfg (bbs: bb_node list) : cfg =
   in
   let rec create_cfg' (ctx: bb_ctx) =
     let process_next cur_edges =
-      match focus_next ctx with
+      match find_next_block ctx with
       | None -> cur_edges
-      | Some ctx' ->
+      | Some (ctx',_) ->
         let rest = create_cfg' ctx' in
         cur_edges @ rest
     in 
@@ -622,6 +675,12 @@ let check_func (c : context) (f : func) =
   let {ftype; locals; body} = f.it in
   let FuncType (ins, out) = type_ c ftype in
   let c' = {c with locals = ins @ locals; results = out; labels = [out]} in
+
+  let bb_tree = create_bb_tree body in
+  print_bb_tree bb_tree;
+  let cfg     = create_cfg bb_tree in
+  print_cfg cfg;
+
   check_block c' body out f.at
 
 

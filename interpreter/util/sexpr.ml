@@ -30,3 +30,15 @@ let output oc width x =
 let print = output stdout
 
 let to_string width x = concat (snd (pp 0 width x)) ^ "\n"
+
+let rec pp_mach off width = function
+  | Atom s -> String.length s, Leaf s
+  | Node (s, xs) ->
+    let lens, rs = List.split (List.map (pp_mach (off + 2) width) xs) in
+    let len = String.length s + List.length rs + List.fold_left (+) 2 lens in
+    let sep, fin =
+      if off + len <= width then " ", ""
+      else let indent = String.make off ' ' in " " ^ indent, "" ^ indent
+    in len, "(" ^+ s ^+ Concat (List.map (fun r -> sep ^+ r) rs) +^ fin +^ ")"
+
+let to_string_mach width x = concat (snd (pp_mach 0 width x))
