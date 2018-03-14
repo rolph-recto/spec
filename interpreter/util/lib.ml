@@ -89,6 +89,17 @@ struct
       match f x with
       | None -> map_filter f xs
       | Some y -> y :: map_filter f xs
+
+  let rec mem x = function
+    | [] -> false
+    | hd::tl -> if x = hd then true else mem x tl
+
+  let rec replace n x lst =
+    match (n, lst) with
+    | (0, y::[]) -> [y]
+    | (_, y::ys) -> y :: (replace (n-1) x ys)
+    | _ -> failwith "replace: bad index"
+
 end
 
 module List32 =

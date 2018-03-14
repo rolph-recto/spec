@@ -366,8 +366,7 @@ let create_bb_tree (is: instr list) : bb_node list =
     let process_instr (acc: bb_node list) (i: instr) =
       match i.it with
       (* branch / exception *)
-      | Br _ | BrIf _ | BrTable _ | Unreachable | Return
-      | Call _ | CallIndirect _ ->
+      | Br _ | BrIf _ | BrTable _ | Unreachable | Return ->
         let acc'  = add_to_current_block i acc in
         let acc'' = (NodeBlock { bb_id=(!n); instrs=[] }) :: acc' in
         n := !n + 1;
@@ -541,7 +540,10 @@ let create_cfg (bbs: bb_node list) : cfg =
 
     (* like branch, but there's a list of targets instead of just one *)
     | BrTable (br_targets, def) ->
-      let targets = def::br_targets in  
+      let remove_dup_targets acc target =
+        if not (List.mem target acc) then target::acc else acc
+      in
+      let targets = def::br_targets |> List.fold_left remove_dup_targets [] in
       List.fold_left add_target_edge acc targets
 
     (* the next two blocks should be the then/else branches of this
@@ -616,6 +618,221 @@ let create_cfg (bbs: bb_node list) : cfg =
     end
 ;;
 
+(* type inference  *)
+(* some changes:
+    - locals need to be able to change types if they are to have types that are
+    more complicated than just variants of Int (e.g objects). because of this,
+    instead of being placed in the context they need to be represented in the
+    stack directly
+    - since locals are represented in the stack directly, instructions such as
+    SetLocal can change inner parts of the stack, not just the top. so the
+    input/output types of instructions cannot just be concatenated to determine
+    the stack type of an instruction list. because of this, we cannot re-use
+    check_instr directly, which makes this assumption
+*)
+
+let rec pop_stack elems s =
+  match (elems, s) with
+  | ([], _) -> s
+  | (e::es, x::xs) ->
+    if e = x 
+    then pop_stack es xs
+    else begin
+      let sx = string_of_value_type x in
+      let se = string_of_value_type e in
+      let msg = Printf.sprintf "got %s, expected %s" sx se in
+      error no_region (Printf.sprintf "pop_stack: unexpected type (%s)" msg)
+    end
+  | (_::_, []) -> error no_region "pop_stack: stack is empty"
+
+let rec push_stack elems s =
+  match elems with
+  | [] -> s
+  | e::es -> push_stack es (e::s)
+
+let rec peek_stack n s =
+  match (n, s) with
+  | (0, x::_) -> x
+  | (_, _::xs) -> peek_stack (n-1) xs
+  | _ -> error no_region "peek_stack: invalid index"
+
+(* get the type of a local in the stack
+ * this assumes that locals are at the bottom of the stack *)
+let get_local n s =
+  let local_ind = List.length s - 1 - (Int32.to_int n.it) in
+  List.nth s local_ind
+
+(* set the type of a local in the stack *)
+let set_local n t s =
+  let local_ind = List.length s - 1 - (Int32.to_int n.it) in
+  Lib.List.replace local_ind t s
+
+let check_instr_no_branch (c: context) (s: stack_type) (e: instr) : stack_type =
+  let sintr = Arrange.instr e |> Sexpr.to_string_mach 0 in
+  Printf.printf "check_instr %s %s\n" sintr (string_of_stack_type s);
+  match e.it with
+  | Unreachable -> s
+
+  | Nop -> s
+
+  | Block _ -> s
+
+  | Loop _ -> s
+
+  | If _ -> s |> pop_stack [I32Type]
+
+  | Br _ -> s
+
+  | BrIf _ -> s |> pop_stack [I32Type]
+
+  | BrTable _ ->
+    Printf.printf "%s\n" (string_of_stack_type s);
+    s |> pop_stack [I32Type]
+
+  | Return -> s |> pop_stack c.results
+
+  | Call x ->
+    let FuncType (ins, out) = func c x in
+    s |> pop_stack ins |> push_stack out
+
+  | CallIndirect x ->
+    ignore (table c (0l @@ e.at));
+    let FuncType (ins, out) = type_ c x in
+    s |> pop_stack [I32Type] |> pop_stack ins |> push_stack out
+
+  | Drop -> s |> pop_stack [peek_stack 0 s]
+
+  | Select ->
+    let t = peek_stack 1 s in
+    s |> pop_stack [I32Type] |> pop_stack [t; t] |> push_stack [t]
+
+  | GetLocal x ->
+    let t = get_local x s in
+    s |> push_stack [t]
+
+  | SetLocal x ->
+    let t = peek_stack 0 s in
+    s |> pop_stack [t] |> set_local x t
+
+  | TeeLocal x ->
+    let t = peek_stack 0 s in
+    s |> set_local x t
+
+  | GetGlobal x ->
+    let GlobalType (t, mut) = global c x in
+    s |> push_stack [t]
+
+  | SetGlobal x ->
+    let GlobalType (t, mut) = global c x in
+    require (mut = Mutable) x.at "global is immutable";
+    s |> pop_stack [t]
+
+  | Load memop ->
+    check_memop c memop (Lib.Option.map fst) e.at;
+    s |> pop_stack [I32Type] |> push_stack [memop.ty]
+
+  | Store memop ->
+    check_memop c memop (fun sz -> sz) e.at;
+    s |> pop_stack [memop.ty] |> pop_stack [I32Type]
+
+  | CurrentMemory ->
+    ignore (memory c (0l @@ e.at));
+    s |> push_stack [I32Type]
+
+  | GrowMemory ->
+    ignore (memory c (0l @@ e.at));
+    s |> pop_stack [I32Type] |> push_stack [I32Type]
+
+  | Const v ->
+    let t = type_value v.it in
+    s |> push_stack [t]
+
+  | Test testop ->
+    let t = type_testop testop in
+    s |> pop_stack [t] |> push_stack [I32Type]
+
+  | Compare relop ->
+    let t = type_relop relop in
+    s |> pop_stack [t; t] |> push_stack [I32Type]
+
+  | Unary unop ->
+    let t = type_unop unop in
+    s |> pop_stack [t] |> push_stack [t]
+
+  | Binary binop ->
+    let t = type_binop binop in
+    s |> pop_stack [t; t] |> push_stack [t]
+
+  | Convert cvtop ->
+    let t1, t2 = type_cvtop e.at cvtop in
+    s |> pop_stack [t1] |> push_stack [t2]
+;;
+
+(* infer the (postcondition) stack type of the basic block by gluing together
+ * the stack types of its instructions *)
+let infer_block_type (c: context) (pre: stack_type) (b: basic_block) : stack_type =
+  List.fold_left (check_instr_no_branch c) pre b.instrs
+;;
+
+module IdMap = Map.Make(struct type t = int let compare = compare end)
+
+let generalize = () ;;
+
+let factorize = () ;;
+
+(* given two stack types, compute their join
+ * returns the join and whether or not the two types were equivalent *)
+let compute_join (st1: stack_type) (st2: stack_type) = (st1, false) ;;
+
+let next_blocks (cfg: cfg) (bb_id: int) : basic_block list =
+  let remove_dup_successors acc s =
+    if not (List.mem s acc) then s::acc else acc
+  in
+  List.filter (fun (s,t) -> s = bb_id) cfg.edges
+  |> List.map snd
+  |> List.fold_left remove_dup_successors []
+  |> List.map (fun id -> List.find (fun b -> b.bb_id = id) cfg.blocks)
+;;
+
+(* worklist algorithm to infer stack types of basic blocks *)
+let infer_block_types (c: context) (cfg: cfg) : stack_type IdMap.t =
+  (* tymap contains preconditions for the first block, the precondition
+   * are the types of the locals, which are assumed to be at the top of
+   * the stack when the function is called *)
+  let rec go bmap tymap = function
+  | []    -> tymap
+  | b::bs ->
+    let process_next post next (tymap', worklist) = 
+      if IdMap.mem next.bb_id tymap'
+      (* compute the join of this block's postcondition with
+       * the existing precondition *)
+      then begin
+        let next_pre = IdMap.find next.bb_id tymap' in
+        let (join, changed) = compute_join next_pre post in
+        (* only process the next block if its precondition changed *)
+        if changed
+        then (IdMap.add next.bb_id join tymap', worklist @ [next])
+        else (tymap', worklist)
+      end
+      (* otherwise, if the next block doesn't have a precondition, set it as
+       * this block's postcondition *)
+      else (IdMap.add next.bb_id post tymap', worklist @ [next])
+    in
+    let pre = IdMap.find b.bb_id tymap in
+    Printf.printf "bb_id: %d; pre: %s\n" b.bb_id (string_of_stack_type pre);
+    let post = infer_block_type c pre b in
+    let succs = next_blocks cfg b.bb_id in
+    let (tymap', worklist) = List.fold_right (process_next post) succs (tymap, bs) in
+    go bmap tymap' worklist
+  in
+  let add_block b acc = IdMap.add b.bb_id b acc in
+  let bmap = List.fold_right add_block cfg.blocks IdMap.empty in
+  let first_block = List.find (fun b -> b.bb_id = 1) cfg.blocks in
+  let init_stack = List.rev c.locals in
+  let tymap = IdMap.empty |> IdMap.add first_block.bb_id init_stack in
+  go bmap tymap [first_block]
+;;
+
 
 (* Types *)
 
@@ -671,6 +888,12 @@ let check_global_type (gt : global_type) at =
 let check_type (t : type_) =
   check_func_type t.it t.at
 
+let print_tymap (tymap: stack_type IdMap.t) =
+  Printf.printf "tymap\n";
+  IdMap.iter begin fun id s ->
+    Printf.printf "(%d, %s)\n" id (string_of_stack_type s)
+  end tymap
+
 let check_func (c : context) (f : func) =
   let {ftype; locals; body} = f.it in
   let FuncType (ins, out) = type_ c ftype in
@@ -680,6 +903,8 @@ let check_func (c : context) (f : func) =
   print_bb_tree bb_tree;
   let cfg     = create_cfg bb_tree in
   print_cfg cfg;
+  let tymap = infer_block_types c cfg in
+  print_tymap tymap;
 
   check_block c' body out f.at
 
@@ -797,3 +1022,4 @@ let check_module (m : module_) =
     "multiple tables are not allowed (yet)";
   require (List.length c.memories <= 1) m.at
     "multiple memories are not allowed (yet)"
+
