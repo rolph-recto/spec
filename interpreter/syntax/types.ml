@@ -1,19 +1,55 @@
 (* Types *)
 
-(* type constructors *)
-type ty_con =
-  | TyVar of string
-  | TyName of string
-  | TyFunc of string * (ty_con list)
-
-(* subtyping constraints *)
-type ty_constr =
-  | Subtype of ty_con * ty_con
-
-type constrained_type =
-  | ConstrainedType of (ty_constr list) * ty_con
+type ty_var = int
+type ty_atom = string
 
 type value_type = I32Type | I64Type | F32Type | F64Type
+                (* | TyName of ty_name *)
+                (* | TyConstrName of ty_constr list * ty_name *)
+
+(* type constructors *)
+and ty_name =
+  | TyVar of ty_var
+  | TyAtom of ty_atom
+  | TyFunc of ty_atom * (ty_name list)
+
+(* subtyping constraints *)
+and ty_constr =
+  | Subtype of ty_var * ty_atom
+
+type block_type = { constrs: ty_constr list; stack: stack_type }
+
+module IntCompare = struct type t = int let compare = compare end
+module IdMap = Map.Make(IntCompare)
+module IdSet = Set.Make(IntCompare)
+
+(* find the least var that is fresh in the block
+ * this is used during generalization when creating fresh variables *)
+let rec get_fresh_var (st: stack_type) =
+  let rec get_var_tyname = function
+  | TyVar v -> [v]
+  | TyAtom -> []
+  | TyFunc (_, args) -> List.map get_var_tyname args |> List.concat
+  in
+  let get_var = function
+  | I32Type | I64Type | F32Type | F64Type -> []
+  | 
+  | TyConstrName (constrs, name) ->
+    let constr_vars = List.map (fun (Subtype (v,_) -> v) constrs in
+    let name_vars = get_var_tyname name in
+    constr_vars @ name_vars
+  in
+  let vars = List.map get_var st |> List.concat in
+  let m = List.fold_right min vars 0 in
+  m + 1
+;;
+
+let subst_stack_vars (st: stack_type) (repl_map: ) : stack_map=
+
+
+;;
+
+
 type elem_type = AnyFuncType
 type stack_type = value_type list
 type func_type = FuncType of stack_type * stack_type
