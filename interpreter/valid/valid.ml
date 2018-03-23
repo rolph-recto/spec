@@ -8,6 +8,9 @@ open Types
 module Invalid = Error.Make ()
 exception Invalid = Invalid.Error
 
+let first_block_id = 1
+let last_block_id = -1
+
 let error = Invalid.error
 let require b at s = if not b then error at s
 
@@ -24,11 +27,17 @@ type context =
   locals : value_type list;
   results : value_type list;
   labels : stack_type list;
+  (* a toposorted list (wrt inheritance) of classes; this is used by the
+   * resolver to compute to compute the least supertype of a given set of
+   * class upper-bounds  *)
+  class_hierarchy : ty_atom list;
 }
 
 let empty_context =
   { types = []; funcs = []; tables = []; memories = [];
-    globals = []; locals = []; results = []; labels = [] }
+    globals = []; locals = []; results = []; labels = [];
+    class_hierarchy = [];
+  }
 
 let lookup category list x =
   try Lib.List32.nth list x.it with Failure _ ->
@@ -611,8 +620,17 @@ let create_cfg (bbs: bb_node list) : cfg =
     let ctx = { zipper=[]; left=[]; right=bs; focus=b; } in
     begin match find_block ctx with
     | Some (ctx', _) ->
-      let blocks  = get_basic_blocks bbs in
-      let edges   = create_cfg' ctx' in
+      let blocks'     = get_basic_blocks bbs in
+      let last_block  = { bb_id=last_block_id; instrs=[] } in
+      let blocks      = last_block::blocks' in
+      let edges'      = create_cfg' ctx' in
+      let last_edges  =
+        List.filter begin fun block ->
+          List.exists (fun (_,t) -> t = block.bb_id) edges' |> not
+        end blocks' |>
+        List.map (fun block -> (block.bb_id, last_block_id))
+      in
+      let edges       =  edges' @ last_edges in
       { blocks; edges; }
 
     | None -> error no_region "no basic block found!"
@@ -645,35 +663,40 @@ let rec pop_stack elems s =
       error no_region (Printf.sprintf "pop_stack: unexpected type (%s)" msg)
     end
   | (_::_, []) -> error no_region "pop_stack: stack is empty"
+;;
 
 let rec push_stack elems s =
   match elems with
   | [] -> s
   | e::es -> push_stack es (e::s)
+;;
 
 let rec peek_stack n s =
   match (n, s) with
   | (0, x::_) -> x
   | (_, _::xs) -> peek_stack (n-1) xs
   | _ -> error no_region "peek_stack: invalid index"
+;;
 
 (* get the type of a local in the stack
  * this assumes that locals are at the bottom of the stack *)
 let get_local n s =
   let local_ind = List.length s - 1 - (Int32.to_int n.it) in
   List.nth s local_ind
+;;
 
 (* set the type of a local in the stack *)
 let set_local n t s =
   let local_ind = List.length s - 1 - (Int32.to_int n.it) in
   Lib.List.replace local_ind t s
+;;
 
 
 let resolve_memop_type (t: value_type) (memop: 'a memop) : value_type =
   match t with
   | I32Type | I64Type | F32Type | F64Type -> memop.ty
-  (* add case here for constrained type *)
-  (* | _ -> *)
+  | _ -> error no_region "TODO: implement resolve_memop_type"
+;;
 
 let check_instr_no_branch (c: context) (s: stack_type) (e: instr) : stack_type =
   let sintr = Arrange.instr e |> Sexpr.to_string_mach 0 in
@@ -782,8 +805,9 @@ let check_instr_no_branch (c: context) (s: stack_type) (e: instr) : stack_type =
 
 (* infer the (postcondition) stack type of the basic block by gluing together
  * the stack types of its instructions *)
-let infer_block_type (c: context) (pre: stack_type) (b: basic_block) : stack_type =
-  List.fold_left (check_instr_no_branch c) pre b.instrs
+let infer_block_type (c: context) (pre: block_type) (b: basic_block) : block_type  =
+  List.fold_left (check_instr_no_branch c) pre.stack b.instrs |>
+  stack_to_block_type
 ;;
 
 type genmap = IdSet.t IdMap.t
@@ -794,46 +818,52 @@ let generalize (st1: stack_type) (st2: stack_type) : stack_type * genmap =
   let min_var = min (get_fresh_var st1) (get_fresh_var st2) in
   let fresh_var = ref min_var in
   let collect_genmaps genmap acc =
-    IdMap.union (fun _ s1 s2 -> Some (IdSet union s1 s2)) genmap acc
+    IdMap.merge begin fun _ v1 v2 ->
+      match v1, v2 with
+      | None, None -> None
+      | Some s1, None -> Some s1
+      | None, Some s2 -> Some s2
+      | Some s1, Some s2 -> Some (IdSet.union s1 s2)
+    end genmap acc
   in
-  let rec generalize_names (tn1: ty_name) (tn2: ty_name) =
-    match tn1, tn2 ->
-    | TyAtom a1, TyAtom n2 when a1 = a2 ->
-      (tn1, IdMap.empty)
+  let rec generalize_names (tn1: ty_name) (tn2: ty_name) = match tn1, tn2 with
+  | TyAtom a1, TyAtom a2 when a1 = a2 ->
+    (tn1, IdMap.empty)
 
-    | TyFunc (f1, args1), TyFunc (f2, args2) when f1 = f2 ->
-      let args = List.combine args1 args2 in
-      let (args', genmaps) =
-        List.map (fun (a1,a2) -> generalize_names a1 a2) args |> List.split
-      in
-      let genmap = List.fold_right collect_genmaps genmaps IdMap.empty in
-      (TyFunc (f1, args'), genmap)
+  | TyFunc (f1, args1), TyFunc (f2, args2) when f1 = f2 ->
+    let args = List.combine args1 args2 in
+    let (args', genmaps) =
+      List.map (fun (a1,a2) -> generalize_names a1 a2) args |> List.split
+    in
+    let genmap = List.fold_right collect_genmaps genmaps IdMap.empty in
+    (TyFunc (f1, args'), genmap)
 
-    | TyVar v1, TyVar v2 when v1 = v2 ->
-      (tn1, IdMap.empty)
+  | TyVar v1, TyVar v2 when v1 = v2 ->
+    (tn1, IdMap.empty)
 
-    | TyVar v1, TyVar v2 when not (v1 = v2) -> 
-      let var = !fresh_var in
-      let varset = IdSet.empty |> IdSet.add v1 |> IdSet.add v2 in
-      let genmap = IdMap.empty |> IdMap.add var varset in
-      fresh_var := !fresh_var + 1;
-      (TyVar var, genmap)
+  | TyVar v1, TyVar v2 when not (v1 = v2) -> 
+    let var = !fresh_var in
+    let varset = IdSet.singleton v1 |> IdSet.add v2 in
+    let genmap = IdMap.singleton var varset in
+    fresh_var := !fresh_var + 1;
+    (TyVar var, genmap)
 
-    | _ -> error no_region "generalize_names: cannot unify type names"
+  | _ -> error no_region "generalize_names: cannot unify type names"
   in
-  let generalize_type (v1: value_type) (v2: value_type) =
-    match (v1, v2) with
-    | I32Type, I32Type | I64Type, I64Type
-    | F32Type, F32Type | F64Type, F64Type ->
-      (v1, IdMap.empty)
+  let generalize_type (v1: value_type) (v2: value_type) = match (v1, v2) with
+  | I32Type, I32Type | I64Type, I64Type
+  | F32Type, F32Type | F64Type, F64Type ->
+    (v1, IdMap.empty)
 
-    | TyName n1, TyName n2 ->
-      generalize_names n1 n2
+  | TyName n1, TyName n2 ->
+    let n, genmap = generalize_names n1 n2 in
+    (TyName n, genmap)
 
-    | TyConstrName _, _ | _, TyConstrName _ ->
-      error no_region "generalize: constrained type names encountered"
+  | TyConstrName _, _ | _, TyConstrName _ ->
+    error no_region "generalize: constrained type names encountered"
+
+  | _, _ ->  error no_region "generalize: type mismatch"
   in
-  let 
   let (st', genmaps) =
     List.combine st1 st2
     |> List.map (fun (v1,v2) -> generalize_type v1 v2) 
@@ -847,22 +877,21 @@ let generalize (st1: stack_type) (st2: stack_type) : stack_type * genmap =
  * this function takes in a constraint resolver to compute the new constraint
  * given a set of constraints for old_vars to which the fresh var is mapped *)
 let factorize (constrs: ty_constr list) (st: stack_type) (genmap: genmap)
-              (resolver: ty_atom list -> ty_atom) : block_type =
+              (resolver: ty_var -> ty_constr list -> ty_constr) : block_type =
 
   (* compute equivalence classes of fresh vars based on
    * the old vars they are mapped to *)
   let equiv_classes =
-    let rec add_to_equiv_class var classes =
-      match classes with
-      (* create new equiv class *)
-      | [] -> [[var]]
-      | c::cs ->
-        let repr = List.hd c in
-        if IdSet.equal (IdMap.find repr) (IdMap.find var)
-        then let c' = var::c in c'::cs
-        else c::(add_to_equiv_class var cs)
+    let rec add_to_equiv_class var classes = match classes with
+    (* create new equiv class *)
+    | [] -> [[var]]
+    | c::cs ->
+      let repr = List.hd c in
+      if IdSet.equal (IdMap.find repr genmap) (IdMap.find var genmap)
+      then let c' = var::c in c'::cs
+      else c::(add_to_equiv_class var cs)
     in
-    let keys = IdMap.bindings genmap |> List.fst in
+    let keys = IdMap.bindings genmap |> List.map fst in
     List.fold_right add_to_equiv_class keys []
   in
   (* for each equivalence class, choose a representative and map all other
@@ -871,21 +900,26 @@ let factorize (constrs: ty_constr list) (st: stack_type) (genmap: genmap)
     let build_class_map cls =
       let repr = List.hd cls in
       let class_map =
-        List.fold_right (fun var acc -> IdMap.add var repr acc) cls
+        List.fold_right (fun var acc -> IdMap.add var repr acc) cls IdMap.empty
       in
       (repr, class_map)
     in
     let merge_class_map (repr, class_map) (reprs, acc) =
-      let merge_err _ _ _ =
-        error no_region "factorize: class maps must be disjoint"
+      let merge_err _ v1 v2 =
+        match v1, v2 with
+        | None, None -> None
+        | Some c1, None -> Some c1
+        | None, Some c2 -> Some c2
+        | Some _, Some _ ->
+          error no_region "factorize: class maps must be disjoint"
       in
-      let acc' = IdMap.union merge_err class_map acc in
+      let acc' = IdMap.merge merge_err class_map acc in
       (repr::reprs, acc')
     in
     let class_maps_with_repr = List.map build_class_map equiv_classes in
-    List.fold_right merge_class_map class_maps ([], IdMap.empty)
+    List.fold_right merge_class_map class_maps_with_repr ([], IdMap.empty)
   in
-  (* rewrite stack type so that fres hvars in equiv class are replaced
+  (* rewrite stack type so that fresh vars in equiv class are replaced
    * with their representatives *)
   let st' = subst_stack_vars st repl_map in
   (* map representatives to the constraints of their old vars *)
@@ -899,36 +933,63 @@ let factorize (constrs: ty_constr list) (st: stack_type) (genmap: genmap)
     List.map build_repr_old_constrs reprs
   in
   let repr_constrs =
-    let resolve_repr_constrs (repr, old_constrs) =
-      let new_constr =
-        List.map (fun Subtype (_, bound) -> bound) old_constrs |> resolver
-      in
-      Subtype (repr, new_constr)
-    in
-    List.map resolve_repr_constrs repr_old_constrs
+    List.map (fun (repr, oldcs) -> resolver repr oldcs) repr_old_constrs
   in
   { constrs = repr_constrs @ constrs; stack = st' }
 ;;
 
-let compute_block_join (c: context) (bt1: block_type) (bt2: block_type) : block_type =
-  let n  = min (List.length bt1.stack) (List.length bt2.stack) in
-  let st1' = Lib.List.drop (List.length bt1.stack - n) bt1.stack in
-  let st2' = Lib.List.drop (List.length bt2.stack - n) bt2.stack in
+let find_least_supertype (c: context) (bounds: ty_atom list) : ty_atom =
+  let rec go classes = match classes with
+  | [] -> error no_region "class bounds do not exist in class hierarchy!"
+  | c::cs -> if List.mem c bounds then c else go cs
+  in
+  go c.class_hierarchy 
+;;
+
+let find_greatest_subtype (c: context) (bounds: ty_atom list) : ty_atom =
+  let rec go classes = match classes with
+  | [] -> error no_region "class bounds do not exist in class hierarchy!"
+  | c::cs -> if List.mem c bounds then c else go cs
+  in
+  go (List.rev c.class_hierarchy)
+;;
+
+let build_resolver (f: ty_atom list -> ty_atom)
+                   (repr: ty_var) (constrs: ty_constr list) : ty_constr =
+  let new_constr =
+    List.map (fun (Subtype (_, bound)) -> bound) constrs |> f
+  in
+  Subtype (repr, new_constr)
+;;
+
+let compute_block_join (c: context) (bt1: block_type) (bt2: block_type)
+                       : (block_type * bool) =
+
+  let (st1', st2') = truncate_stacks bt1.stack bt2.stack in
   let (st', genmap) = generalize st1' st2' in
-  let constrs' = (* combine bt1 and bt2 constraints here *)
-  let resolver = (* build resolver from context *)
+  let constrs' =
+    let s1 = ConstrSet.of_list bt1.constrs in
+    let s2 = ConstrSet.of_list bt2.constrs in
+    let s  = ConstrSet.union s1 s2 in
+    ConstrSet.elements s
+  in
+  (* this resolver is not tied to a specific constraint "theory";
+   * as long as you can build this for your constraints, then
+   * the constraints can be used *)
+  let resolver = build_resolver (find_least_supertype c) in
   let bt' = factorize constrs' st' genmap resolver in
-  bt'
+  let block_same = is_block_equiv bt' bt1 in
+  (bt', block_same)
 ;;
 
 (* given two stack types, compute their join
  * returns the join and whether or not the two types were equivalent *)
+(*
 let compute_join (st1: stack_type) (st2: stack_type) =
-  let n = min (List.length st1) (List.length st2) in
-  let st1'  = Lib.List.drop (List.length st1 - n) st1 in
-  let st2'  = Lib.List.drop (List.length st2 - n) St2 in
-  (st1, true)
+  let (st1', st2') = truncate_stacks st1 st2 in
+  (st1', true)
 ;;
+*)
 
 let next_blocks (cfg: cfg) (bb_id: int) : basic_block list =
   let remove_dup_successors acc s =
@@ -941,20 +1002,20 @@ let next_blocks (cfg: cfg) (bb_id: int) : basic_block list =
 ;;
 
 (* worklist algorithm to infer stack types of basic blocks *)
-let infer_block_types (c: context) (cfg: cfg) : stack_type IdMap.t =
+let infer_block_types (c: context) (cfg: cfg) : block_type IdMap.t =
   (* tymap contains preconditions for the first block, the precondition
    * are the types of the locals, which are assumed to be at the top of
    * the stack when the function is called *)
-  let rec go bmap tymap = function
+  let rec go bmap (tymap: block_type IdMap.t) = function
   | []    -> tymap
   | b::bs ->
-    let process_next post next (tymap', worklist) = 
+    let process_next post next (tymap', worklist) =
       if IdMap.mem next.bb_id tymap'
       (* compute the join of this block's postcondition with
        * the existing precondition *)
       then begin
         let next_pre = IdMap.find next.bb_id tymap' in
-        let (join, not_changed) = compute_join next_pre post in
+        let (join, not_changed) = compute_block_join c next_pre post in
         (* only process the next block if its precondition changed *)
         if not_changed
         then (tymap', worklist)
@@ -965,18 +1026,91 @@ let infer_block_types (c: context) (cfg: cfg) : stack_type IdMap.t =
       else (IdMap.add next.bb_id post tymap', worklist @ [next])
     in
     let pre = IdMap.find b.bb_id tymap in
-    Printf.printf "bb_id: %d; pre: %s\n" b.bb_id (string_of_stack_type pre);
+    Printf.printf "bb_id: %d; pre: %s\n" b.bb_id (string_of_stack_type pre.stack);
     let post = infer_block_type c pre b in
     let succs = next_blocks cfg b.bb_id in
-    let (tymap', worklist) = List.fold_right (process_next post) succs (tymap, bs) in
+    let (tymap', worklist) =
+      List.fold_right (process_next post) succs (tymap, bs)
+    in
     go bmap tymap' worklist
   in
   let add_block b acc = IdMap.add b.bb_id b acc in
   let bmap = List.fold_right add_block cfg.blocks IdMap.empty in
-  let first_block = List.find (fun b -> b.bb_id = 1) cfg.blocks in
-  let init_stack = List.rev c.locals in
-  let tymap = IdMap.empty |> IdMap.add first_block.bb_id init_stack in
+  let first_block = List.find (fun b -> b.bb_id = first_block_id) cfg.blocks in
+  let first_block_pre = stack_to_block_type (List.rev c.locals) in
+  let tymap = IdMap.singleton first_block.bb_id first_block_pre in
   go bmap tymap [first_block]
+;;
+
+(* TODO: implement this *)
+let is_class_subtype (c: context) (cls1: ty_atom) (cls2: ty_atom) : bool =
+  true
+;;
+
+let is_block_subtype (c: context) (b1: block_type) (b2: block_type) : bool =
+  let rec subtype_names (tn1: ty_name) (tn2: ty_name) = match tn1, tn2 with
+  | TyAtom a1, TyAtom a2 when a1 = a2 -> IdMap.empty
+
+  | TyFunc (f1, args1), TyFunc (f2, args2) when f1 = f2 ->
+    let collect_assign_maps (arg1, arg2) acc =
+      let arg_assign_map = subtype_names arg1 arg2 in
+      IdMap.merge begin fun _ v1 v2 ->
+        match v1, v2 with
+        | None, None -> None
+        | Some amap1, None -> Some amap1
+        | None, Some amap2 -> Some amap2
+        | Some _, Some _ -> error no_region "subtype_names: tyvar mapped twice" 
+      end arg_assign_map acc
+    in
+    let args = List.combine args1 args2 in
+    List.fold_right collect_assign_maps args IdMap.empty
+
+  | TyVar v1, TyVar v2 -> IdMap.singleton v1 v2
+
+  | _ -> error no_region "subtype_names: cannot unify type names"
+  in
+  let subtype_vals (v1: value_type) (v2: value_type) = match (v1, v2) with
+  | I32Type, I32Type | I64Type, I64Type
+  | F32Type, F32Type | F64Type, F64Type -> true
+
+  | TyName n1, TyName n2 ->
+    begin try 
+      let build_constr_map constrs var acc =
+        let var_constrs =
+          List.map begin fun cons ->
+            match cons with
+            | Subtype (svar, cls) when svar = var -> [cls]
+            | _ -> []
+          end constrs
+          |> List.concat
+        in
+        IdMap.add var var_constrs acc
+      in
+      let assign_map = subtype_names n1 n2 in
+      let (keys, elems) = IdMap.bindings assign_map |> List.split in
+      let constr_map1 =
+        List.fold_right (build_constr_map b1.constrs) keys IdMap.empty
+      in
+      let constr_map2 =
+        List.fold_right (build_constr_map b2.constrs) elems IdMap.empty
+      in
+      IdMap.for_all begin fun v1 v2 ->
+        let constrs1 = IdMap.find v1 constr_map1 in
+        let constrs2 = IdMap.find v2 constr_map2 in
+        let glb1 = find_greatest_subtype c constrs1 in
+        let glb2 = find_greatest_subtype c constrs2 in
+        is_class_subtype c glb1 glb2
+      end assign_map
+    with | _ -> false end
+
+  | TyConstrName _, _ | _, TyConstrName _ ->
+    error no_region "generalize: constrained type names encountered"
+
+  | _, _ -> false
+  in
+  let (st1', st2') = truncate_stacks b1.stack b2.stack in
+  List.combine st1' st2' |>
+  List.for_all (fun (v1, v2) -> subtype_vals v1 v2)
 ;;
 
 
@@ -1034,10 +1168,10 @@ let check_global_type (gt : global_type) at =
 let check_type (t : type_) =
   check_func_type t.it t.at
 
-let print_tymap (tymap: stack_type IdMap.t) =
+let print_tymap (tymap: block_type IdMap.t) =
   Printf.printf "tymap\n";
-  IdMap.iter begin fun id s ->
-    Printf.printf "(%d, %s)\n" id (string_of_stack_type s)
+  IdMap.iter begin fun id block ->
+    Printf.printf "(%d, %s)\n" id (string_of_stack_type block.stack)
   end tymap
 
 let check_func (c : context) (f : func) =
@@ -1050,8 +1184,11 @@ let check_func (c : context) (f : func) =
   let cfg     = create_cfg bb_tree in
   print_cfg cfg;
   let tymap = infer_block_types c cfg in
+  let inferred_out_bt = IdMap.find last_block_id tymap in
+  let out_bt = stack_to_block_type out in
+  let is_out_subtype = is_block_subtype c inferred_out_bt out_bt in
   print_tymap tymap;
-
+  Printf.printf "out conforms to type? %b\n" is_out_subtype;
   check_block c' body out f.at
 
 
