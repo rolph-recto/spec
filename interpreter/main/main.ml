@@ -31,7 +31,8 @@ let argspec = Arg.align
   "-h", Arg.Clear Flags.harness, " exclude harness for JS convesion";
   "-d", Arg.Set Flags.dry, " dry, do not run program";
   "-t", Arg.Set Flags.trace, " trace execution";
-  "-v", Arg.Unit banner, " show version"
+  "-v", Arg.Unit banner, " show version";
+  "-italx", Arg.Set Flags.italx, " typecheck italx example module";
 ]
 
 let () =
@@ -42,10 +43,17 @@ let () =
       (fun file -> add_arg ("(input " ^ quote file ^ ")")) usage;
     List.iter (fun arg -> if not (Run.run_string arg) then exit 1) !args;
     if !args = [] then Flags.interactive := true;
-    if !Flags.interactive then begin
-      Flags.print_sig := true;
-      banner ();
-      Run.run_stdin ()
+
+    if !Flags.italx
+    then begin
+      Valid.check_module_italx Valid.example_module
+    end
+    else begin
+      if !Flags.interactive then begin
+        Flags.print_sig := true;
+        banner ();
+        Run.run_stdin ()
+      end
     end
   with exn ->
     flush_all ();

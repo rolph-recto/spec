@@ -660,7 +660,13 @@ let module_ s =
   let funcs =
     List.map2 Source.(fun t f -> {f.it with ftype = t} @@ f.at)
       func_types func_bodies
-  in {types; tables; memories; globals; funcs; imports; exports; elems; data; start}
+  in
+  let class_hierarchy = [] in
+  let tyname_structs = TynameMap.empty in
+  {
+    types; tables; memories; globals; funcs; imports; exports; elems;
+    data; start; class_hierarchy; tyname_structs;
+  }
 
 
 let decode name bs = at module_ (stream name bs)
