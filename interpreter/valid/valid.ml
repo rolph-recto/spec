@@ -660,36 +660,6 @@ let create_cfg (bbs: bb_node list) : cfg =
     check_instr directly, which makes this assumption
 *)
 
-let rec pop_stack elems s =
-  match (elems, s) with
-  | ([], _) -> s
-  | (e::es, x::xs) -> pop_stack es xs
-  (*
-    if e = x 
-    then pop_stack es xs
-    else begin
-      let sx = string_of_value_type x in
-      let se = string_of_value_type e in
-      let msg = Printf.sprintf "got %s, expected %s" sx se in
-      error no_region (Printf.sprintf "pop_stack: unexpected type (%s)" msg)
-    end
-  *)
-  | (_::_, []) -> error no_region "pop_stack: stack is empty"
-;;
-
-let rec push_stack elems s =
-  match elems with
-  | [] -> s
-  | e::es -> push_stack es (e::s)
-;;
-
-let rec peek_stack n s =
-  match (n, s) with
-  | (0, x::_) -> x
-  | (_, _::xs) -> peek_stack (n-1) xs
-  | _ -> error no_region "peek_stack: invalid index"
-;;
-
 (* get the type of a local in the stack
  * this assumes that locals are at the bottom of the stack *)
 let get_local n s =
@@ -750,6 +720,53 @@ let get_constr_map (constrs: ty_constr list) (vars: ty_var list) : (ty_atom list
   List.fold_right build_constr_map vars IdMap.empty
 ;;
 
+let is_block_subtype (c: context) (b1: block_type) (b2: block_type) : bool =
+  let rec subtype_names (tn1: ty_name) (tn2: ty_name) = match tn1, tn2 with
+  | TyAtom a1, TyAtom a2 when a1 = a2 -> IdMap.empty
+  | TyFunc (f1, args1), TyFunc (f2, args2) when f1 = f2 ->
+    let collect_assign_maps (arg1, arg2) acc =
+      let arg_assign_map = subtype_names arg1 arg2 in
+      IdMap.merge begin fun _ v1 v2 ->
+        match v1, v2 with
+        | None, None -> None
+        | Some amap1, None -> Some amap1
+        | None, Some amap2 -> Some amap2
+        | Some _, Some _ -> error no_region "subtype_names: tyvar mapped twice" 
+      end arg_assign_map acc
+    in
+    let args = List.combine args1 args2 in
+    List.fold_right collect_assign_maps args IdMap.empty
+  | TyVar v1, TyVar v2 -> IdMap.singleton v1 v2
+  | TyConstr _, _ | _, TyConstr _ ->
+    error no_region "is_block_subtype: constrained type names encountered"
+  | _ -> error no_region "subtype_names: cannot unify type names"
+  in
+  let subtype_vals (v1: value_type) (v2: value_type) = match (v1, v2) with
+  | I32Type, I32Type | I64Type, I64Type
+  | F32Type, F32Type | F64Type, F64Type -> true
+  | TyName n1, TyName n2
+    when get_tyname_constrs n1 = [] && get_tyname_constrs n2 = [] ->
+    let assign_map = subtype_names n1 n2 in
+    let (keys, elems) = IdMap.bindings assign_map |> List.split in
+    let constr_map1 = get_constr_map b1.constrs keys in
+    let constr_map2 = get_constr_map b2.constrs elems in
+    IdMap.for_all begin fun v1 v2 ->
+      let constrs1 = IdMap.find v1 constr_map1 in
+      let constrs2 = IdMap.find v2 constr_map2 in
+      let glb1 = find_greatest_subtype c constrs1 in
+      let glb2 = find_greatest_subtype c constrs2 in
+      is_class_subtype c glb1 glb2
+    end assign_map
+  | TyName n1, TyName n2
+    when not (get_tyname_constrs n1 = []) || not (get_tyname_constrs n2 = []) ->
+    error no_region "is_block_subtype: constrained type names encountered"
+  | _, _ -> false
+  in
+  let (st1', st2') = truncate_stacks b1.stack b2.stack in
+  List.combine st1' st2' |>
+  List.for_all (fun (v1, v2) -> subtype_vals v1 v2)
+;;
+
 let rec get_struct_offset (ts: tyname_struct) (offset: int) : value_type =
   match ts with
   | [] -> error no_region "get_struct_offset: offset greater than struct length"
@@ -798,6 +815,43 @@ let resolve_memop_type (c: context) (constrs: ty_constr list)
     transform_value_type inv_repl_map offset_ty
 ;;
 
+let rec pop_stack ctx bconstrs elems s =
+  let len_elems = List.length elems in
+  let len_s = List.length s in
+  if len_elems > len_s 
+  then error no_region "pop_stack: stack is empty"
+  else begin
+    let types_match =
+      let elems_block = alpha_convert_bound_stack s elems |> stack_to_block_type in
+      let elems_block' =
+        { elems_block with constrs=bconstrs@elems_block.constrs }
+      in
+      let s' = s |> List.rev |> Lib.List.drop (len_s - len_elems) |> List.rev in
+      let s_block = stack_to_block_type s' in
+      let s_block' = { s_block with constrs=bconstrs@s_block.constrs } in
+      (* contravariance! need to query s <: elems instead of elems <: s *) 
+      is_block_subtype ctx s_block' elems_block'
+    in
+    if not types_match
+    then error no_region "pop_stack: unexpected type"
+    else Lib.List.drop len_elems s
+  end
+;;
+
+let rec push_stack elems s =
+  match elems with
+  | [] -> s
+  | e::es -> push_stack es (e::s)
+;;
+
+let rec peek_stack n s =
+  match (n, s) with
+  | (0, x::_) -> x
+  | (_, _::xs) -> peek_stack (n-1) xs
+  | _ -> error no_region "peek_stack: invalid index"
+;;
+
+
 let check_instr_no_branch (c: context) (b: block_type) (e: instr) : block_type  =
   let sintr = Arrange.instr e |> Sexpr.to_string_mach 0 in
   let s = b.stack in
@@ -811,27 +865,28 @@ let check_instr_no_branch (c: context) (b: block_type) (e: instr) : block_type  
 
   | Loop _ -> { b with stack=s }
 
-  | If _ -> { b with stack=s |> pop_stack [I32Type] }
+  | If _ -> { b with stack=s |> pop_stack c b.constrs [I32Type] }
 
   | Br _ -> { b with stack=s }
 
-  | BrIf _ -> { b with stack=s |> pop_stack [I32Type] }
+  | BrIf _ -> { b with stack=s |> pop_stack c b.constrs [I32Type] }
 
-  | BrTable _ -> { b with stack=s |> pop_stack [I32Type] }
+  | BrTable _ -> { b with stack=s |> pop_stack c b.constrs [I32Type] }
 
-  | Return -> { b with stack=s |> pop_stack c.results }
+  | Return -> { b with stack=s |> pop_stack c b.constrs c.results }
 
   | Call x ->
     let FuncType (ins, out) = func c x in
     let out' = alpha_convert_stack b.stack out in
     let bout = stack_to_block_type out' in
     { constrs=b.constrs @ bout.constrs;
-      stack=s |> pop_stack ins |> push_stack bout.stack; }
+      stack=s |> pop_stack c b.constrs ins |> push_stack bout.stack; }
 
-  (* ignore function type annotation and extract function type from offset *)
   | CallIndirect x ->
     ignore (table c (0l @@ e.at));
     let t = peek_stack 0 s in
+    (* if the offset's type is a type name, extract the function type from it;
+     * otherwise, use the annotation as an index to the table of function types *)
     let FuncType (ins, out) =
       match t with
       | TyName tyname -> tyname_to_func_type tyname
@@ -840,14 +895,16 @@ let check_instr_no_branch (c: context) (b: block_type) (e: instr) : block_type  
     let out' = alpha_convert_stack b.stack out in
     let bout = stack_to_block_type out' in
     { constrs=b.constrs @ bout.constrs;
-      stack=s |> pop_stack [t] |> pop_stack ins |> push_stack bout.stack; }
+      stack=s |> pop_stack c b.constrs [t] |> pop_stack c b.constrs ins |>
+            push_stack bout.stack; }
 
-  | Drop -> { b with stack=s |> pop_stack [peek_stack 0 s] }
+  | Drop -> { b with stack=s |> pop_stack c b.constrs [peek_stack 0 s] }
 
   | Select ->
     let t = peek_stack 1 s in
     { b with
-      stack=s |> pop_stack [I32Type] |> pop_stack [t; t] |> push_stack [t] }
+      stack=s |> pop_stack c b.constrs [I32Type] |>
+            pop_stack c b.constrs [t; t] |> push_stack [t] }
 
   | GetLocal x ->
     let t = get_local x s in
@@ -855,7 +912,7 @@ let check_instr_no_branch (c: context) (b: block_type) (e: instr) : block_type  
 
   | SetLocal x ->
     let t = peek_stack 0 s in
-    { b with stack=s |> pop_stack [t] |> set_local x t }
+    { b with stack=s |> pop_stack c b.constrs [t] |> set_local x t }
 
   | TeeLocal x ->
     let t = peek_stack 0 s in
@@ -868,19 +925,20 @@ let check_instr_no_branch (c: context) (b: block_type) (e: instr) : block_type  
   | SetGlobal x ->
     let GlobalType (t, mut) = global c x in
     require (mut = Mutable) x.at "global is immutable";
-    { b with stack=s |> pop_stack [t] }
+    { b with stack=s |> pop_stack c b.constrs [t] }
 
   | Load memop ->
     check_memop c memop (Lib.Option.map fst) e.at;
     let in_ty   = peek_stack 0 s in
     let out_ty  = resolve_memop_type c b.constrs in_ty memop in
-    { b with stack=s |> pop_stack [in_ty] |> push_stack [out_ty] }
+    { b with stack=s |> pop_stack c b.constrs [in_ty] |> push_stack [out_ty] }
 
   | Store memop ->
     check_memop c memop (fun sz -> sz) e.at;
     let in_ty   = peek_stack 1 s in
     let out_ty  = resolve_memop_type c b.constrs in_ty memop in
-    { b with stack=s |> pop_stack [out_ty] |> pop_stack [in_ty] }
+    { b with stack=s |> pop_stack c b.constrs [out_ty] |>
+                   pop_stack c b.constrs [in_ty] }
 
   | CurrentMemory ->
     ignore (memory c (0l @@ e.at));
@@ -888,7 +946,7 @@ let check_instr_no_branch (c: context) (b: block_type) (e: instr) : block_type  
 
   | GrowMemory ->
     ignore (memory c (0l @@ e.at));
-    { b with stack=s |> pop_stack [I32Type] |> push_stack [I32Type] }
+    { b with stack=s |> pop_stack c b.constrs [I32Type] |> push_stack [I32Type] }
 
   | Const v ->
     let t = type_value v.it in
@@ -896,23 +954,23 @@ let check_instr_no_branch (c: context) (b: block_type) (e: instr) : block_type  
 
   | Test testop ->
     let t = type_testop testop in
-    { b with stack=s |> pop_stack [t] |> push_stack [I32Type] }
+    { b with stack=s |> pop_stack c b.constrs [t] |> push_stack [I32Type] }
 
   | Compare relop ->
     let t = type_relop relop in
-    { b with stack=s |> pop_stack [t; t] |> push_stack [I32Type] }
+    { b with stack=s |> pop_stack c b.constrs [t; t] |> push_stack [I32Type] }
 
   | Unary unop ->
     let t = type_unop unop in
-    { b with stack=s |> pop_stack [t] |> push_stack [t] }
+    { b with stack=s |> pop_stack c b.constrs [t] |> push_stack [t] }
 
   | Binary binop ->
     let t = type_binop binop in
-    { b with stack=s |> pop_stack [t; t] |> push_stack [t] }
+    { b with stack=s |> pop_stack c b.constrs [t; t] |> push_stack [t] }
 
   | Convert cvtop ->
     let t1, t2 = type_cvtop e.at cvtop in
-    { b with stack=s |> pop_stack [t1] |> push_stack [t2] }
+    { b with stack=s |> pop_stack c b.constrs [t1] |> push_stack [t2] }
 ;;
 
 (* infer the (postcondition) stack type of the basic block by gluing together
@@ -1125,53 +1183,6 @@ let infer_block_types (c: context) (cfg: cfg) : block_type IdMap.t =
   let tymap = IdMap.singleton first_block.bb_id first_block_pre in
   Printf.printf "# basic block type inference #\n\n";
   go bmap tymap [first_block]
-;;
-
-let is_block_subtype (c: context) (b1: block_type) (b2: block_type) : bool =
-  let rec subtype_names (tn1: ty_name) (tn2: ty_name) = match tn1, tn2 with
-  | TyAtom a1, TyAtom a2 when a1 = a2 -> IdMap.empty
-  | TyFunc (f1, args1), TyFunc (f2, args2) when f1 = f2 ->
-    let collect_assign_maps (arg1, arg2) acc =
-      let arg_assign_map = subtype_names arg1 arg2 in
-      IdMap.merge begin fun _ v1 v2 ->
-        match v1, v2 with
-        | None, None -> None
-        | Some amap1, None -> Some amap1
-        | None, Some amap2 -> Some amap2
-        | Some _, Some _ -> error no_region "subtype_names: tyvar mapped twice" 
-      end arg_assign_map acc
-    in
-    let args = List.combine args1 args2 in
-    List.fold_right collect_assign_maps args IdMap.empty
-  | TyVar v1, TyVar v2 -> IdMap.singleton v1 v2
-  | TyConstr _, _ | _, TyConstr _ ->
-    error no_region "is_block_subtype: constrained type names encountered"
-  | _ -> error no_region "subtype_names: cannot unify type names"
-  in
-  let subtype_vals (v1: value_type) (v2: value_type) = match (v1, v2) with
-  | I32Type, I32Type | I64Type, I64Type
-  | F32Type, F32Type | F64Type, F64Type -> true
-  | TyName n1, TyName n2
-    when get_tyname_constrs n1 = [] && get_tyname_constrs n2 = [] ->
-    let assign_map = subtype_names n1 n2 in
-    let (keys, elems) = IdMap.bindings assign_map |> List.split in
-    let constr_map1 = get_constr_map b1.constrs keys in
-    let constr_map2 = get_constr_map b2.constrs elems in
-    IdMap.for_all begin fun v1 v2 ->
-      let constrs1 = IdMap.find v1 constr_map1 in
-      let constrs2 = IdMap.find v2 constr_map2 in
-      let glb1 = find_greatest_subtype c constrs1 in
-      let glb2 = find_greatest_subtype c constrs2 in
-      is_class_subtype c glb1 glb2
-    end assign_map
-  | TyName n1, TyName n2
-    when not (get_tyname_constrs n1 = []) || not (get_tyname_constrs n2 = []) ->
-    error no_region "is_block_subtype: constrained type names encountered"
-  | _, _ -> false
-  in
-  let (st1', st2') = truncate_stacks b1.stack b2.stack in
-  List.combine st1' st2' |>
-  List.for_all (fun (v1, v2) -> subtype_vals v1 v2)
 ;;
 
 
@@ -1458,10 +1469,22 @@ let point3d_struct =
 let point3d_vtable =
 [
   TyName (TyFunc ("Tag", [TyAtom "Point3D"]));
-  TyName (TyFunc ("Func", [TyAtom "getColor"]));
-  TyName (TyFunc ("Func", [TyAtom "getX"]));
-  TyName (TyFunc ("Func", [TyAtom "getY"]));
-  TyName (TyFunc ("Func", [TyAtom "getZ"]));
+  TyName (tyfunc "Func" [TyAtom "getColor";
+    tyfunc "Args" [tyconstr [0 << "Point"] (tyfunc "Ins" [TyVar 0])];
+    tyfunc "Ret" [tyconstr [1 << "RGB"] (tyfunc "Ins" [TyVar 1])];
+  ]);
+  TyName (tyfunc "Func" [TyAtom "getX";
+    tyfunc "Args" [tyconstr [0 << "Point"] (tyfunc "Ins" [TyVar 0])];
+    tyfunc "Ret" [TyAtom "I32Type"];
+  ]);
+  TyName (tyfunc "Func" [TyAtom "getY";
+    tyfunc "Args" [tyconstr [0 << "Point"] (tyfunc "Ins" [TyVar 0])];
+    tyfunc "Ret" [TyAtom "I32Type"];
+  ]);
+  TyName (tyfunc "Func" [TyAtom "getZ";
+    tyfunc "Args" [tyconstr [0 << "Point"] (tyfunc "Ins" [TyVar 0])];
+    tyfunc "Ret" [TyAtom "I32Type"];
+  ]);
 ];;
 
 let rgb_struct = 
@@ -1491,46 +1514,40 @@ let example_structs =
 ;;
 
 (* iTalX test *)
+(* load vtable of an object, get function pointers, then call functions *)
 let example_module : module_ =
   let body = [
     (* call point.getColor() *)
+
+    (* load object ref twice; one of the object refs will be used as the
+     * first argument to the function call *)
     GetLocal (Int32.of_int 0 @@ no_region)  @@ no_region;
     GetLocal (Int32.of_int 0 @@ no_region)  @@ no_region;
+    (* load vtable *)
     Load { ty=I32Type; align=0; offset=Int32.of_int 0; sz=None } @@ no_region;
+    (* load function at vtable offset 1 *)
     Load { ty=I32Type; align=0; offset=Int32.of_int 1; sz=None } @@ no_region;
+    (* call function *)
     CallIndirect (Int32.of_int 0 @@ no_region) @@ no_region;
 
-    (* call point.getX() *)
+    (* call point.getX(), basically the same as above *)
     GetLocal (Int32.of_int 0 @@ no_region)  @@ no_region;
     GetLocal (Int32.of_int 0 @@ no_region)  @@ no_region;
     Load { ty=I32Type; align=0; offset=Int32.of_int 0; sz=None } @@ no_region;
     Load { ty=I32Type; align=0; offset=Int32.of_int 2; sz=None } @@ no_region;
     CallIndirect (Int32.of_int 1 @@ no_region) @@ no_region;
   ] in
-  let ftype = Int32.of_int 2 @@ no_region in
+  (* f :: exists a << Point. Ins(a) -> (int32, exists b << RGB. Ins(b)) *)
+  let ftype = Int32.of_int 0 @@ no_region in
   let locals = [] in
-  let f = { ftype; locals; body } @@ no_region in
   let ftype0 = 
-    (* exists a << Point. Ins(a) -> exists b << RGB. Ins(b) *)
-    FuncType (
-      [TyName (tyconstr [0 << "Point"] (tyfunc "Ins" [TyVar 0]))],
-      [TyName (tyconstr [1 << "RGB"] (tyfunc "Ins" [TyVar 1]))]
-    )
-  in
-  let ftype1 = 
-    (* exists a << Point. Ins(a) -> exists b << RGB. Ins(b) *)
-    FuncType (
-      [TyName (tyconstr [0 << "Point"] (tyfunc "Ins" [var 0]))],
-      [I32Type])
-  in
-  let ftype2 = 
-    (* exists a << Point. Ins(a) -> exists b << RGB. Ins(b) *)
     FuncType (
       [TyName (tyconstr [0 << "Point"] (tyfunc "Ins" [var 0]))],
       [I32Type; TyName (tyconstr [1 << "RGB"] (tyfunc "Ins" [TyVar 1]))]
     )
-  in
-  { types=[ftype0 @@ no_region; ftype1 @@ no_region; ftype2 @@ no_region];
+  in 
+  let f = { ftype; locals; body } @@ no_region in
+  { types=[ftype0 @@ no_region];
     funcs=[f]; globals=[];
     tables=[{ ttype=TableType ({min=Int32.of_int 0;max=None}, AnyFuncType) } @@ no_region]; 
     memories=[{ mtype=MemoryType { min=Int32.of_int 0; max=None } } @@ no_region]; 

@@ -133,9 +133,24 @@ let rec get_tyvars_stack (st: stack_type) : ty_var list =
     | TyName tyname -> get_tyvars_tyname tyname
   end st |> List.concat
 ;;
+
+let rec get_bound_tyvars_tyname (name: ty_name) : ty_var list =
+  match name with
+  | TyConstr (constrs, _) ->
+    List.map get_tyvars_constr constrs |> List.concat |>
+    IdSet.of_list |> IdSet.elements
+  | _ -> []
+;;
+
+let rec get_bound_tyvars_stack (st: stack_type) : ty_var list =
+  List.map begin fun vt ->
+    match vt with
+    | I32Type | I64Type | F32Type | F64Type -> []
+    | TyName tyname -> get_bound_tyvars_tyname tyname
+  end st |> List.concat
+;;
   
-let truncate_stacks (st1: stack_type) (st2: stack_type)
-    : (stack_type * stack_type) =
+let truncate_stacks (st1: stack_type) (st2: stack_type) : (stack_type * stack_type) =
   let n  = min (List.length st1) (List.length st2) in
   let st1' = Lib.List.drop (List.length st1 - n) st1 in
   let st2' = Lib.List.drop (List.length st2 - n) st2 in
@@ -172,6 +187,18 @@ let get_fresh_var (st: stack_type) =
 let alpha_convert_stack (st1: stack_type) (st2: stack_type) =
   let max_var = get_fresh_var st1 in
   let tyvars = get_tyvars_stack st2 in
+  let varmap =
+    tyvars |> List.map (fun v -> (v,v+max_var)) |> fun varlst ->
+    let add_to_varmap (v,v') acc = IdMap.add v (TyVar v') acc in
+    List.fold_right add_to_varmap varlst IdMap.empty
+  in
+  subst_stack_vars varmap st2
+;;
+
+(* only alpha convert bound variables *)
+let alpha_convert_bound_stack (st1: stack_type) (st2: stack_type) =
+  let max_var = get_fresh_var st1 in
+  let tyvars = get_bound_tyvars_stack st2 in
   let varmap =
     tyvars |> List.map (fun v -> (v,v+max_var)) |> fun varlst ->
     let add_to_varmap (v,v') acc = IdMap.add v (TyVar v') acc in
