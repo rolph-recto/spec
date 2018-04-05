@@ -1,5 +1,4 @@
-(* Decoding stream *)
-
+(* Decoding stream *) 
 type stream =
 {
   name : string;

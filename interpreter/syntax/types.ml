@@ -5,13 +5,13 @@ type ty_atom = string
 
 type value_type = I32Type | I64Type | F32Type | F64Type
                 | TyName of ty_name
-                | TyConstrName of ty_constr list * ty_name
 
 (* type constructors *)
 and ty_name =
   | TyVar of ty_var
   | TyAtom of ty_atom
   | TyFunc of ty_atom * (ty_name list)
+  | TyConstr of ty_constr list * ty_name
 
 (* subtyping constraints *)
 and ty_constr =
@@ -38,7 +38,28 @@ module ConstrSet = Set.Make(ConstrCompare)
 module AtomSet = Set.Make(StrCompare)
 module TynameMap = Map.Make(TynameCompare)
 
+let rec hoist_tyname_constrs (tyname: ty_name) : ty_constr list * ty_name =
+  match tyname with
+  | TyVar _ | TyAtom _ -> ([], tyname)
+  | TyFunc (f, args) ->
+    let (arg_constrs, args') =
+      List.map hoist_tyname_constrs args |> List.split
+    in
+    (List.concat arg_constrs, TyFunc (f,args'))
+  | TyConstr (constrs, tyname) -> (constrs, tyname)
+;;
+
+let rec get_tyname_constrs (tyname: ty_name) : ty_constr list =
+  hoist_tyname_constrs tyname |> fst
+;;
+
 let rec subst_tyname (repl_map: ty_name IdMap.t) (tyname: ty_name) : ty_name =
+  let subst_constr = function
+  | Subtype (v, a) when IdMap.mem v repl_map ->
+    (* when this is called, vars should be mapped to vars *)
+    let (TyVar v') = IdMap.find v repl_map in Subtype (v', a)
+  | s -> s
+  in
   match tyname with
   | TyVar v when IdMap.mem v repl_map -> IdMap.find v repl_map
   | TyVar v -> TyVar v
@@ -46,24 +67,18 @@ let rec subst_tyname (repl_map: ty_name IdMap.t) (tyname: ty_name) : ty_name =
   | TyFunc (f, args) ->
     let args' = List.map (subst_tyname repl_map) args in
     TyFunc (f, args')
+  | TyConstr (constrs, constr_tyname) ->
+    let constrs'  = List.map subst_constr constrs in
+    let constr_tyname'   = subst_tyname repl_map constr_tyname in
+    TyConstr (constrs', constr_tyname')
 ;;
 
 let subst_value_type (repl_map: ty_name IdMap.t) (vt: value_type) : value_type =
-  let subst_constr = function
-  | Subtype (v, a) when IdMap.mem v repl_map ->
-    (* when this is called, vars should be mapped to vars *)
-    let (TyVar v') = IdMap.find v repl_map in Subtype (v', a)
-  | s -> s
-  in
   match vt with
   | I32Type | I64Type | F32Type | F64Type -> vt
   | TyName tyname ->
     let tyname' = subst_tyname repl_map tyname in
     TyName tyname'
-  | TyConstrName (constrs, tyname) ->
-    let constrs'  = List.map subst_constr constrs in
-    let tyname'   = subst_tyname repl_map tyname in
-    TyConstrName (constrs', tyname')
 ;;
 
 let subst_stack_vars (repl_map: ty_name IdMap.t) (st: stack_type) : stack_type =
@@ -80,6 +95,9 @@ let rec transform_tyname (repl_map: ty_name TynameMap.t) (tyname: ty_name) : ty_
   | TyFunc (f, args) ->
     let args' = List.map (transform_tyname repl_map) args in
     TyFunc (f, args')
+  | TyConstr (constrs, constr_tyname) ->
+    let constr_tyname' = transform_tyname repl_map constr_tyname in
+    TyConstr (constrs, constr_tyname')
 ;;
 
 let transform_value_type (repl_map: ty_name TynameMap.t) (vt: value_type) : value_type =
@@ -90,18 +108,29 @@ let transform_value_type (repl_map: ty_name TynameMap.t) (vt: value_type) : valu
     TyName tyname'
 ;;
 
-let rec get_tyvars (name: ty_name) : ty_var list =
+let get_tyvars_constr (constr: ty_constr) : ty_var list =
+  match constr with
+  | Subtype (v, _) -> [v]
+
+let rec get_tyvars_tyname (name: ty_name) : ty_var list =
   match name with
   | TyVar v -> [v]
   | TyAtom a -> []
-  | TyFunc (_, args) -> List.map get_tyvars args |> List.concat
+  | TyFunc (_, args) ->
+    List.map get_tyvars_tyname args |> List.concat |>
+    IdSet.of_list |> IdSet.elements
+  | TyConstr (constrs, constr_tyname) ->
+    let constr_vars = List.map get_tyvars_constr constrs in
+    let tyname_vars = get_tyvars_tyname constr_tyname in
+    List.concat (tyname_vars::constr_vars) |>
+    IdSet.of_list |> IdSet.elements
 ;;
 
 let rec get_tyvars_stack (st: stack_type) : ty_var list =
   List.map begin fun vt ->
     match vt with
     | I32Type | I64Type | F32Type | F64Type -> []
-    | TyName tyname | TyConstrName (_, tyname) -> get_tyvars tyname
+    | TyName tyname -> get_tyvars_tyname tyname
   end st |> List.concat
 ;;
   
@@ -116,29 +145,22 @@ let truncate_stacks (st1: stack_type) (st2: stack_type)
 let stack_to_block_type (st: stack_type) : block_type = 
   let hoist_constraints vt = 
     match vt with
-    | I32Type | I64Type | F32Type | F64Type | TyName _ -> (vt, [])
-    | TyConstrName (constrs, name) -> (TyName name, constrs)
+    | I32Type | I64Type | F32Type | F64Type -> ([], vt)
+    | TyName tyname ->
+      let (constrs, tyname') = hoist_tyname_constrs tyname in
+      (constrs, TyName tyname')
   in
-  let (stack, constrs') = st |> List.map hoist_constraints |> List.split in
-  let constrs = List.concat constrs' in
+  let (constrs_lst, stack) = st |> List.map hoist_constraints |> List.split in
+  let constrs = List.concat constrs_lst in
   { constrs; stack }
 ;;
 
 (* find the least var that is fresh in the block
  * this is used during generalization when creating fresh variables *)
-let rec get_fresh_var (st: stack_type) =
-  let rec get_var_tyname = function
-  | TyVar v -> [v]
-  | TyAtom _ -> []
-  | TyFunc (_, args) -> List.map get_var_tyname args |> List.concat
-  in
+let get_fresh_var (st: stack_type) =
   let get_var = function
   | I32Type | I64Type | F32Type | F64Type -> []
-  | TyName name -> get_var_tyname name
-  | TyConstrName (constrs, name) ->
-    let constr_vars = List.map (fun (Subtype (v,_)) -> v) constrs in
-    let name_vars = get_var_tyname name in
-    constr_vars @ name_vars
+  | TyName name -> get_tyvars_tyname name
   in
   let vars = List.map get_var st |> List.concat in
   let m = List.fold_right min vars 0 in
@@ -158,16 +180,32 @@ let alpha_convert_stack (st1: stack_type) (st2: stack_type) =
   subst_stack_vars varmap st2
 ;;
 
+(* TODO: make this more easily parameterizable, since
+ * this equality depends on the "theory" of the constraints *)
+let constr_sets_equal vcs1 vcs2 =
+  let atoms1 =
+    ConstrSet.elements vcs1 |> List.map (fun (Subtype (_, a)) -> a)
+    |> AtomSet.of_list
+  in
+  let atoms2 =
+    ConstrSet.elements vcs2 |> List.map (fun (Subtype (_, a)) -> a)
+    |> AtomSet.of_list
+  in
+  AtomSet.equal atoms1 atoms2
+;;
+
 (* check for alpha-equivalence of block types *)
 let is_block_equiv (bt1: block_type) (bt2: block_type) : bool = 
-  let build_constr_map (Subtype (var,a)) acc =
-    if IdMap.mem var acc
-    then begin
-      let varmap = IdMap.find var acc in
-      let varmap' = AtomSet.add a varmap in
-      IdMap.add var varmap' acc
-    end
-    else IdMap.add var (AtomSet.singleton a) acc
+  let build_constr_map constr acc =
+    match constr with
+    | Subtype (var, a) ->
+      if IdMap.mem var acc
+      then begin
+        let varmap = IdMap.find var acc in
+        let varmap' = ConstrSet.add constr varmap in
+        IdMap.add var varmap' acc
+      end
+      else IdMap.add var (ConstrSet.singleton constr) acc
   in
   let vconstrs1 = List.fold_right build_constr_map bt1.constrs IdMap.empty in
   let vconstrs2 = List.fold_right build_constr_map bt2.constrs IdMap.empty in
@@ -177,7 +215,7 @@ let is_block_equiv (bt1: block_type) (bt2: block_type) : bool =
     | TyVar v1, TyVar v2 ->
       let vcs1 = IdMap.find v1 vconstrs1 in
       let vcs2 = IdMap.find v2 vconstrs1 in
-      AtomSet.equal vcs1 vcs2
+      constr_sets_equal vcs1 vcs2
 
     | TyAtom a1, TyAtom a2 when a1 = a2 -> true
 
@@ -193,8 +231,6 @@ let is_block_equiv (bt1: block_type) (bt2: block_type) : bool =
     | I32Type, I32Type | I64Type, I64Type
     | F32Type, F32Type | F64Type, F64Type -> true
     | TyName t1, TyName t2 -> compare_tynames t1 t2
-    | TyConstrName _, _ | _, TyConstrName _ ->
-      failwith "constrained tyname not expected in block type"
     | _ -> false
   in
   let rec compare_val_type_list s1 s2 =
@@ -211,6 +247,25 @@ let is_block_equiv (bt1: block_type) (bt2: block_type) : bool =
 
 type elem_type = AnyFuncType
 type func_type = FuncType of stack_type * stack_type
+
+let tyname_to_primitive (tyname: ty_name) : value_type =
+  match tyname with
+  | TyAtom "I32Type" -> I32Type
+  | TyAtom "I64Type" -> I64Type
+  | TyAtom "F32Type" -> F32Type
+  | TyAtom "F64Type" -> F64Type
+  | _ -> TyName tyname
+;;
+
+let tyname_to_func_type (tyname: ty_name) : func_type =
+  match tyname with
+  | TyFunc ("Func", [TyAtom f; TyFunc ("Args", args); TyFunc ("Ret", ret)]) ->
+    let vargs = List.map tyname_to_primitive args in
+    let vret = List.map tyname_to_primitive ret in
+    FuncType (vargs, vret)
+
+  | _ -> failwith "tyname_to_func_type: tyname is not a function type"
+;;
 
 type 'a limits = {min : 'a; max : 'a option}
 type mutability = Immutable | Mutable
@@ -275,15 +330,19 @@ let globals =
 
 (* String conversion *)
 
+let string_of_constr = function
+  | Subtype (v, a) -> Printf.sprintf "%d << %s" v a
+
 let rec string_of_tyname = function
   | TyVar v -> string_of_int v
   | TyAtom a -> a
   | TyFunc (f, args) -> 
     let str_args = args |> List.map string_of_tyname |> String.concat "," in
     Printf.sprintf "%s(%s)" f str_args
-
-let string_of_constr = function
-  | Subtype (v, a) -> Printf.sprintf "%d << %s" v a
+  | TyConstr (constrs, constr_tyname) ->
+    let str_constrs = constrs |> List.map string_of_constr |> String.concat "," in
+    let str_constr_tyname = string_of_tyname constr_tyname in
+    Printf.sprintf "%s.%s" str_constrs str_constr_tyname
 
 let string_of_value_type = function
   | I32Type -> "i32"
@@ -291,10 +350,6 @@ let string_of_value_type = function
   | F32Type -> "f32"
   | F64Type -> "f64"
   | TyName tyname -> string_of_tyname tyname
-  | TyConstrName (constrs, tyname) ->
-    let str_constrs = constrs |> List.map string_of_constr |> String.concat "," in
-    let str_tyname = string_of_tyname tyname in
-    Printf.sprintf "%s.%s" str_constrs str_tyname
 
 let string_of_value_types = function
   | [t] -> string_of_value_type t

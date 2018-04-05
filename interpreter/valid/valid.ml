@@ -350,6 +350,7 @@ let rec print_bb_tree ?(indent=0) (bb_tree: bb_node list) =
         (Arrange.instr instr |> Sexpr.to_string_mach 0)
     end block.instrs
   in
+  Printf.printf "# Basic Blocks #\n\n";
   List.iter begin fun bb_node ->
     match bb_node with
     | NodeBlock block ->
@@ -363,8 +364,9 @@ let rec print_bb_tree ?(indent=0) (bb_tree: bb_node list) =
   end bb_tree
 
 let print_cfg (cfg: cfg) = 
+  Printf.printf "\n# CFG #\n\n";
   List.iter begin fun (s,t) ->
-    Printf.printf "(%d, %d)\n" s t;
+    Printf.printf "basic block %d => basic block %d\n" s t;
   end cfg.edges
 
 (* REGION: CFG computation *)
@@ -702,7 +704,7 @@ let set_local n t s =
 ;;
 
 let rec is_class_subtype (c: context) (cls1: ty_atom) (cls2: ty_atom) : bool =
-  if cls1 == cls2
+  if cls1 = cls2
   then true
   else begin
     try begin
@@ -761,8 +763,6 @@ let rec get_struct_offset (ts: tyname_struct) (offset: int) : value_type =
       | hdtl::_ -> hdtl
       | [] -> error no_region "get_struct_offset: offset greater than struct length"
       end
-    | TyConstrName _ ->
-      error no_region "get_struct_offset: cannot get struct for tyname with constraints"
     end
 ;;
 
@@ -774,7 +774,7 @@ let resolve_memop_type (c: context) (constrs: ty_constr list)
   | TyName tyname ->
     (* instantiate variables of tyname with most accurate mapping known
      * i.e. greatest subtype of tyvar constraints *)  
-    let tyvars = get_tyvars tyname in
+    let tyvars = get_tyvars_tyname tyname in
     let constr_map = get_constr_map constrs tyvars in
     let get_var_subst var_constrs = 
       let glb = find_greatest_subtype c var_constrs in
@@ -796,15 +796,12 @@ let resolve_memop_type (c: context) (constrs: ty_constr list)
       List.fold_right add_to_tyname_map inv_binds TynameMap.empty
     in
     transform_value_type inv_repl_map offset_ty
-
-  | TyConstrName _ ->
-    error no_region "resolve_memop_type: unexpected tyname with constraints"
 ;;
 
 let check_instr_no_branch (c: context) (b: block_type) (e: instr) : block_type  =
   let sintr = Arrange.instr e |> Sexpr.to_string_mach 0 in
   let s = b.stack in
-  Printf.printf "check_instr %s %s\n" sintr (string_of_stack_type s);
+  Printf.printf "check_instr %s %s\n" sintr (string_of_block_type b);
   match e.it with
   | Unreachable -> { b with stack=s }
 
@@ -828,27 +825,29 @@ let check_instr_no_branch (c: context) (b: block_type) (e: instr) : block_type  
     let FuncType (ins, out) = func c x in
     let out' = alpha_convert_stack b.stack out in
     let bout = stack_to_block_type out' in
-    { b with
-      constrs=b.constrs @ bout.constrs;
-      stack=s |> pop_stack ins |> push_stack bout.stack;
-    }
+    { constrs=b.constrs @ bout.constrs;
+      stack=s |> pop_stack ins |> push_stack bout.stack; }
 
+  (* ignore function type annotation and extract function type from offset *)
   | CallIndirect x ->
     ignore (table c (0l @@ e.at));
-    let FuncType (ins, out) = type_ c x in
     let t = peek_stack 0 s in
+    let FuncType (ins, out) =
+      match t with
+      | TyName tyname -> tyname_to_func_type tyname
+      | _ -> type_ c x
+    in
     let out' = alpha_convert_stack b.stack out in
     let bout = stack_to_block_type out' in
-    { b with
-      constrs=b.constrs @ bout.constrs;
-      stack=s |> pop_stack [t] |> pop_stack ins |> push_stack bout.stack;
-    }
+    { constrs=b.constrs @ bout.constrs;
+      stack=s |> pop_stack [t] |> pop_stack ins |> push_stack bout.stack; }
 
   | Drop -> { b with stack=s |> pop_stack [peek_stack 0 s] }
 
   | Select ->
     let t = peek_stack 1 s in
-    { b with stack=s |> pop_stack [I32Type] |> pop_stack [t; t] |> push_stack [t] }
+    { b with
+      stack=s |> pop_stack [I32Type] |> pop_stack [t; t] |> push_stack [t] }
 
   | GetLocal x ->
     let t = get_local x s in
@@ -960,6 +959,9 @@ let generalize (st1: stack_type) (st2: stack_type) : stack_type * genmap =
     fresh_var := !fresh_var + 1;
     (TyVar var, genmap)
 
+  | TyConstr _, _ | _, TyConstr _ ->
+    error no_region "generalize: constrained type names encountered"
+
   | _ -> error no_region "generalize_names: cannot unify type names"
   in
   let generalize_type (v1: value_type) (v2: value_type) = match (v1, v2) with
@@ -970,9 +972,6 @@ let generalize (st1: stack_type) (st2: stack_type) : stack_type * genmap =
   | TyName n1, TyName n2 ->
     let n, genmap = generalize_names n1 n2 in
     (TyName n, genmap)
-
-  | TyConstrName _, _ | _, TyConstrName _ ->
-    error no_region "generalize: constrained type names encountered"
 
   | _, _ ->  error no_region "generalize: type mismatch"
   in
@@ -1111,7 +1110,7 @@ let infer_block_types (c: context) (cfg: cfg) : block_type IdMap.t =
       else (IdMap.add next.bb_id post tymap', worklist @ [next])
     in
     let pre = IdMap.find b.bb_id tymap in
-    Printf.printf "bb_id: %d; pre: %s\n" b.bb_id (string_of_block_type pre);
+    Printf.printf "\nbasic block %d\nprecondition: %s\n\n" b.bb_id (string_of_block_type pre);
     let post = infer_block_type c pre b in
     let succs = next_blocks cfg b.bb_id in
     let (tymap', worklist) =
@@ -1124,6 +1123,7 @@ let infer_block_types (c: context) (cfg: cfg) : block_type IdMap.t =
   let first_block = List.find (fun b -> b.bb_id = first_block_id) cfg.blocks in
   let first_block_pre = stack_to_block_type (List.rev c.locals) in
   let tymap = IdMap.singleton first_block.bb_id first_block_pre in
+  Printf.printf "# basic block type inference #\n\n";
   go bmap tymap [first_block]
 ;;
 
@@ -1144,26 +1144,28 @@ let is_block_subtype (c: context) (b1: block_type) (b2: block_type) : bool =
     let args = List.combine args1 args2 in
     List.fold_right collect_assign_maps args IdMap.empty
   | TyVar v1, TyVar v2 -> IdMap.singleton v1 v2
+  | TyConstr _, _ | _, TyConstr _ ->
+    error no_region "is_block_subtype: constrained type names encountered"
   | _ -> error no_region "subtype_names: cannot unify type names"
   in
   let subtype_vals (v1: value_type) (v2: value_type) = match (v1, v2) with
   | I32Type, I32Type | I64Type, I64Type
   | F32Type, F32Type | F64Type, F64Type -> true
-  | TyName n1, TyName n2 ->
-    begin try 
-      let assign_map = subtype_names n1 n2 in
-      let (keys, elems) = IdMap.bindings assign_map |> List.split in
-      let constr_map1 = get_constr_map b1.constrs keys in
-      let constr_map2 = get_constr_map b2.constrs elems in
-      IdMap.for_all begin fun v1 v2 ->
-        let constrs1 = IdMap.find v1 constr_map1 in
-        let constrs2 = IdMap.find v2 constr_map2 in
-        let glb1 = find_greatest_subtype c constrs1 in
-        let glb2 = find_greatest_subtype c constrs2 in
-        is_class_subtype c glb1 glb2
-      end assign_map
-    with | _ -> false end
-  | TyConstrName _, _ | _, TyConstrName _ ->
+  | TyName n1, TyName n2
+    when get_tyname_constrs n1 = [] && get_tyname_constrs n2 = [] ->
+    let assign_map = subtype_names n1 n2 in
+    let (keys, elems) = IdMap.bindings assign_map |> List.split in
+    let constr_map1 = get_constr_map b1.constrs keys in
+    let constr_map2 = get_constr_map b2.constrs elems in
+    IdMap.for_all begin fun v1 v2 ->
+      let constrs1 = IdMap.find v1 constr_map1 in
+      let constrs2 = IdMap.find v2 constr_map2 in
+      let glb1 = find_greatest_subtype c constrs1 in
+      let glb2 = find_greatest_subtype c constrs2 in
+      is_class_subtype c glb1 glb2
+    end assign_map
+  | TyName n1, TyName n2
+    when not (get_tyname_constrs n1 = []) || not (get_tyname_constrs n2 = []) ->
     error no_region "is_block_subtype: constrained type names encountered"
   | _, _ -> false
   in
@@ -1228,9 +1230,9 @@ let check_type (t : type_) =
   check_func_type t.it t.at
 
 let print_tymap (tymap: block_type IdMap.t) =
-  Printf.printf "tymap\n";
+  Printf.printf "\n# basic block type map #\n\n";
   IdMap.iter begin fun id block ->
-    Printf.printf "(%d, %s)\n" id (string_of_block_type block)
+    Printf.printf "basic block %d: %s)\n" id (string_of_block_type block)
   end tymap
 
 let check_func (c : context) (f : func) =
@@ -1383,7 +1385,7 @@ let check_func_italx (c : context) (f : func) =
 
   let str_inferred_out_bt = string_of_block_type inferred_out_bt' in
   let str_out_bt = string_of_block_type out_bt in
-  Printf.printf "inferred out: %s\nout annotation: %s\n" str_inferred_out_bt str_out_bt;
+  Printf.printf "\ninferred out: %s\nout annotation: %s\n" str_inferred_out_bt str_out_bt;
   Printf.printf "inferred out type conforms to annotation? %b\n" is_out_subtype;
 ;;
 
@@ -1410,6 +1412,10 @@ let check_module_italx (m : module_) =
   List.iter (check_func_italx c) funcs;
 ;;
 
+let (<<) v a = Subtype (v, a)
+let tyfunc f args = TyFunc (f, args)
+let var v = TyVar v
+let tyconstr constrs tyname = TyConstr (constrs, tyname)
 
 let example_hierarchy = [
   ("Object", "Point");
@@ -1427,9 +1433,18 @@ let point_struct =
 let point_vtable =
 [
   TyName (TyFunc ("Tag", [TyAtom "Point"]));
-  TyName (TyFunc ("Func", [TyAtom "getColor"]));
-  TyName (TyFunc ("Func", [TyAtom "getX"]));
-  TyName (TyFunc ("Func", [TyAtom "getY"]));
+  TyName (tyfunc "Func" [TyAtom "getColor";
+    tyfunc "Args" [tyconstr [0 << "Point"] (tyfunc "Ins" [TyVar 0])];
+    tyfunc "Ret" [tyconstr [1 << "RGB"] (tyfunc "Ins" [TyVar 1])];
+  ]);
+  TyName (tyfunc "Func" [TyAtom "getX";
+    tyfunc "Args" [tyconstr [0 << "Point"] (tyfunc "Ins" [TyVar 0])];
+    tyfunc "Ret" [TyAtom "I32Type"];
+  ]);
+  TyName (tyfunc "Func" [TyAtom "getY";
+    tyfunc "Args" [tyconstr [0 << "Point"] (tyfunc "Ins" [TyVar 0])];
+    tyfunc "Ret" [TyAtom "I32Type"];
+  ]);
 ];;
 
 let point3d_struct = 
@@ -1446,6 +1461,7 @@ let point3d_vtable =
   TyName (TyFunc ("Func", [TyAtom "getColor"]));
   TyName (TyFunc ("Func", [TyAtom "getX"]));
   TyName (TyFunc ("Func", [TyAtom "getY"]));
+  TyName (TyFunc ("Func", [TyAtom "getZ"]));
 ];;
 
 let rgb_struct = 
@@ -1460,7 +1476,6 @@ let rgb_vtable =
 [
   TyName (TyFunc ("Tag", [TyAtom "RGB"]));
 ];;
-
 
 let example_structs =
   let point_atom = TyAtom "Point" in
@@ -1477,24 +1492,46 @@ let example_structs =
 
 (* iTalX test *)
 let example_module : module_ =
-  (* call point.getColor() *)
   let body = [
+    (* call point.getColor() *)
     GetLocal (Int32.of_int 0 @@ no_region)  @@ no_region;
     GetLocal (Int32.of_int 0 @@ no_region)  @@ no_region;
     Load { ty=I32Type; align=0; offset=Int32.of_int 0; sz=None } @@ no_region;
     Load { ty=I32Type; align=0; offset=Int32.of_int 1; sz=None } @@ no_region;
     CallIndirect (Int32.of_int 0 @@ no_region) @@ no_region;
+
+    (* call point.getX() *)
+    GetLocal (Int32.of_int 0 @@ no_region)  @@ no_region;
+    GetLocal (Int32.of_int 0 @@ no_region)  @@ no_region;
+    Load { ty=I32Type; align=0; offset=Int32.of_int 0; sz=None } @@ no_region;
+    Load { ty=I32Type; align=0; offset=Int32.of_int 2; sz=None } @@ no_region;
+    CallIndirect (Int32.of_int 1 @@ no_region) @@ no_region;
   ] in
-  let ftype = Int32.of_int 0 @@ no_region in
+  let ftype = Int32.of_int 2 @@ no_region in
   let locals = [] in
   let f = { ftype; locals; body } @@ no_region in
-  let ftype = 
+  let ftype0 = 
     (* exists a << Point. Ins(a) -> exists b << RGB. Ins(b) *)
     FuncType (
-      [TyConstrName ([Subtype (0, "Point")], TyFunc ("Ins", [TyVar 0]))],
-      [TyConstrName ([Subtype (1, "RGB")], TyFunc ("Ins", [TyVar 1]))])
+      [TyName (tyconstr [0 << "Point"] (tyfunc "Ins" [TyVar 0]))],
+      [TyName (tyconstr [1 << "RGB"] (tyfunc "Ins" [TyVar 1]))]
+    )
   in
-  { types=[ftype @@ no_region]; funcs=[f]; globals=[];
+  let ftype1 = 
+    (* exists a << Point. Ins(a) -> exists b << RGB. Ins(b) *)
+    FuncType (
+      [TyName (tyconstr [0 << "Point"] (tyfunc "Ins" [var 0]))],
+      [I32Type])
+  in
+  let ftype2 = 
+    (* exists a << Point. Ins(a) -> exists b << RGB. Ins(b) *)
+    FuncType (
+      [TyName (tyconstr [0 << "Point"] (tyfunc "Ins" [var 0]))],
+      [I32Type; TyName (tyconstr [1 << "RGB"] (tyfunc "Ins" [TyVar 1]))]
+    )
+  in
+  { types=[ftype0 @@ no_region; ftype1 @@ no_region; ftype2 @@ no_region];
+    funcs=[f]; globals=[];
     tables=[{ ttype=TableType ({min=Int32.of_int 0;max=None}, AnyFuncType) } @@ no_region]; 
     memories=[{ mtype=MemoryType { min=Int32.of_int 0; max=None } } @@ no_region]; 
     start=None; elems=[]; data=[]; imports=[]; exports=[];
