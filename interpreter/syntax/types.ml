@@ -53,13 +53,15 @@ let rec get_tyname_constrs (tyname: ty_name) : ty_constr list =
   hoist_tyname_constrs tyname |> fst
 ;;
 
-let rec subst_tyname (repl_map: ty_name IdMap.t) (tyname: ty_name) : ty_name =
-  let subst_constr = function
+let subst_constr repl_map constr =
+  match constr with
   | Subtype (v, a) when IdMap.mem v repl_map ->
     (* when this is called, vars should be mapped to vars *)
     let (TyVar v') = IdMap.find v repl_map in Subtype (v', a)
   | s -> s
-  in
+;;
+
+let rec subst_tyname (repl_map: ty_name IdMap.t) (tyname: ty_name) : ty_name =
   match tyname with
   | TyVar v when IdMap.mem v repl_map -> IdMap.find v repl_map
   | TyVar v -> TyVar v
@@ -68,8 +70,8 @@ let rec subst_tyname (repl_map: ty_name IdMap.t) (tyname: ty_name) : ty_name =
     let args' = List.map (subst_tyname repl_map) args in
     TyFunc (f, args')
   | TyConstr (constrs, constr_tyname) ->
-    let constrs'  = List.map subst_constr constrs in
-    let constr_tyname'   = subst_tyname repl_map constr_tyname in
+    let constrs' = List.map (subst_constr repl_map) constrs in
+    let constr_tyname' = subst_tyname repl_map constr_tyname in
     TyConstr (constrs', constr_tyname')
 ;;
 
@@ -126,30 +128,16 @@ let rec get_tyvars_tyname (name: ty_name) : ty_var list =
     IdSet.of_list |> IdSet.elements
 ;;
 
-let rec get_tyvars_stack (st: stack_type) : ty_var list =
-  List.map begin fun vt ->
-    match vt with
-    | I32Type | I64Type | F32Type | F64Type -> []
-    | TyName tyname -> get_tyvars_tyname tyname
-  end st |> List.concat
+let get_tyvars_value_type (vt: value_type) : ty_var list =
+  match vt with
+  | I32Type | I64Type | F32Type | F64Type -> []
+  | TyName tyname -> get_tyvars_tyname tyname
 ;;
 
-let rec get_bound_tyvars_tyname (name: ty_name) : ty_var list =
-  match name with
-  | TyConstr (constrs, _) ->
-    List.map get_tyvars_constr constrs |> List.concat |>
-    IdSet.of_list |> IdSet.elements
-  | _ -> []
+let get_tyvars_stack (st: stack_type) : ty_var list =
+  st |> List.map get_tyvars_value_type |> List.concat
 ;;
 
-let rec get_bound_tyvars_stack (st: stack_type) : ty_var list =
-  List.map begin fun vt ->
-    match vt with
-    | I32Type | I64Type | F32Type | F64Type -> []
-    | TyName tyname -> get_bound_tyvars_tyname tyname
-  end st |> List.concat
-;;
-  
 let truncate_stacks (st1: stack_type) (st2: stack_type) : (stack_type * stack_type) =
   let n  = min (List.length st1) (List.length st2) in
   let st1' = Lib.List.drop (List.length st1 - n) st1 in
@@ -170,41 +158,80 @@ let stack_to_block_type (st: stack_type) : block_type =
   { constrs; stack }
 ;;
 
+(* make sure tyname constraints don't shadow each other *)
+let make_tyname_unique ?(init_var=0) (tyname: ty_name) =
+  let fresh_var = ref init_var in
+  let rec go varmap name =
+    match name with
+    | TyVar v when IdMap.mem v varmap ->
+      let TyVar v' = IdMap.find v varmap in TyVar v'
+    | TyFunc (f, args) ->
+      let args' = List.map (go varmap) args in
+      TyFunc (f, args')
+    | TyConstr (constrs, constr_name) ->
+      let constr_vars = constrs |> List.map get_tyvars_constr |> List.concat in
+      let constr_vars_inc = List.map (fun x -> x+1) constr_vars in
+      fresh_var := List.fold_right max constr_vars_inc !fresh_var;
+      let varmap' =
+        constr_vars |> List.map (fun v -> (v, v + !fresh_var)) |> fun varlst ->
+        let add_to_varmap (v,v') acc = IdMap.add v (TyVar v') acc in
+        List.fold_right add_to_varmap varlst varmap
+      in
+      let constrs' = List.map (subst_constr varmap') constrs in
+      let constr_name' = go varmap' constr_name in
+      TyConstr (constrs', constr_name')
+    | _ -> name
+  in
+  go IdMap.empty tyname
+;;
+
+let make_value_type_unique ?(init_var=0) (vt: value_type) : value_type =
+  match vt with
+  | I32Type | I64Type | F32Type | F64Type -> vt
+  | TyName tyname ->
+    let tyname' = make_tyname_unique ~init_var:init_var tyname in
+    TyName tyname'
+;;
+
+let make_stack_unique ?(init_var=0) (st: stack_type) : stack_type =
+  let go (fresh_var, acc) vt =
+    let vt' = make_value_type_unique ~init_var:fresh_var vt in
+    let tyvars = get_tyvars_value_type vt' in
+    let tyvars_inc = List.map (fun x -> x+1) tyvars in
+    let fresh_var' = List.fold_right max tyvars_inc fresh_var in
+    (fresh_var', acc@[vt'])
+  in
+  let (_, st') = List.fold_left go (init_var, []) st in
+  st'
+;;
+
 (* find the least var that is fresh in the block
  * this is used during generalization when creating fresh variables *)
-let get_fresh_var (st: stack_type) =
-  let get_var = function
-  | I32Type | I64Type | F32Type | F64Type -> []
-  | TyName name -> get_tyvars_tyname name
-  in
-  let vars = List.map get_var st |> List.concat in
-  let m = List.fold_right min vars 0 in
+let get_fresh_var_tyname (tyname: ty_name) =
+  let vars = get_tyvars_tyname tyname in
+  let m = List.fold_right max vars 0 in
   m + 1
+;;
+
+let get_fresh_var_value_type (vt: value_type) =
+  match vt with
+  | I32Type | I64Type | F32Type | F64Type -> 0
+  | TyName name -> get_fresh_var_tyname name
+;;
+
+let get_fresh_var_stack (st: stack_type) =
+  let get_fresh_vars = function
+  | I32Type | I64Type | F32Type | F64Type -> 0
+  | TyName name -> get_fresh_var_tyname name
+  in
+  List.fold_right max (List.map get_fresh_vars st) 0
 ;;
 
 (* rewrite stack type so that it doesn't have any vars that
  * are the same from some other stack *)
-let alpha_convert_stack (st1: stack_type) (st2: stack_type) =
-  let max_var = get_fresh_var st1 in
-  let tyvars = get_tyvars_stack st2 in
-  let varmap =
-    tyvars |> List.map (fun v -> (v,v+max_var)) |> fun varlst ->
-    let add_to_varmap (v,v') acc = IdMap.add v (TyVar v') acc in
-    List.fold_right add_to_varmap varlst IdMap.empty
-  in
-  subst_stack_vars varmap st2
-;;
-
-(* only alpha convert bound variables *)
-let alpha_convert_bound_stack (st1: stack_type) (st2: stack_type) =
-  let max_var = get_fresh_var st1 in
-  let tyvars = get_bound_tyvars_stack st2 in
-  let varmap =
-    tyvars |> List.map (fun v -> (v,v+max_var)) |> fun varlst ->
-    let add_to_varmap (v,v') acc = IdMap.add v (TyVar v') acc in
-    List.fold_right add_to_varmap varlst IdMap.empty
-  in
-  subst_stack_vars varmap st2
+let alpha_convert_stack (st1: stack_type) (st2: stack_type) : stack_type =
+  let st1_fresh_var = get_fresh_var_stack st1 in
+  make_stack_unique ~init_var:st1_fresh_var st2
 ;;
 
 (* TODO: make this more easily parameterizable, since

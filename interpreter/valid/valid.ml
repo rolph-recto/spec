@@ -335,11 +335,6 @@ type bb_edge = int * int
 type cfg = { blocks: basic_block list; edges: bb_edge list; }
 
 (* util printing functions *)
-let print_instrs (instrs: instr list) =
-  List.iter begin fun i ->
-    Printf.printf "%s\n" (Arrange.instr i |> Sexpr.to_string_mach 0)
-  end instrs
-
 let rec print_bb_tree ?(indent=0) (bb_tree: bb_node list) =
   let print_ctrl_label = function
     | CtrlBlock -> "block" | CtrlLoop -> "loop" | CtrlIf -> "if"
@@ -712,7 +707,8 @@ let get_var_constrs (constrs: ty_constr list) (var: ty_var) : ty_atom list =
   |> List.concat
 ;;
 
-let get_constr_map (constrs: ty_constr list) (vars: ty_var list) : (ty_atom list) IdMap.t =
+let get_constr_map (constrs: ty_constr list) (vars: ty_var list)
+                   : (ty_atom list) IdMap.t =
   let build_constr_map var acc =
     let var_constrs = get_var_constrs constrs var in
     IdMap.add var var_constrs acc
@@ -721,46 +717,56 @@ let get_constr_map (constrs: ty_constr list) (vars: ty_var list) : (ty_atom list
 ;;
 
 let is_block_subtype (c: context) (b1: block_type) (b2: block_type) : bool =
-  let rec subtype_names (tn1: ty_name) (tn2: ty_name) = match tn1, tn2 with
-  | TyAtom a1, TyAtom a2 when a1 = a2 -> IdMap.empty
-  | TyFunc (f1, args1), TyFunc (f2, args2) when f1 = f2 ->
-    let collect_assign_maps (arg1, arg2) acc =
-      let arg_assign_map = subtype_names arg1 arg2 in
-      IdMap.merge begin fun _ v1 v2 ->
-        match v1, v2 with
-        | None, None -> None
-        | Some amap1, None -> Some amap1
-        | None, Some amap2 -> Some amap2
-        | Some _, Some _ -> error no_region "subtype_names: tyvar mapped twice" 
-      end arg_assign_map acc
-    in
-    let args = List.combine args1 args2 in
-    List.fold_right collect_assign_maps args IdMap.empty
-  | TyVar v1, TyVar v2 -> IdMap.singleton v1 v2
-  | TyConstr _, _ | _, TyConstr _ ->
-    error no_region "is_block_subtype: constrained type names encountered"
-  | _ -> error no_region "subtype_names: cannot unify type names"
+  (* build a map assigning variables of b1 to variables of b2 *)
+  let rec subtype_names (tn1: ty_name) (tn2: ty_name) =
+    match tn1, tn2 with
+    | TyAtom a1, TyAtom a2 when a1 = a2 -> IdMap.empty
+    | TyFunc (f1, args1), TyFunc (f2, args2) when f1 = f2 ->
+      let collect_assign_maps (arg1, arg2) acc =
+        let arg_assign_map = subtype_names arg1 arg2 in
+        IdMap.merge begin fun _ v1 v2 ->
+          match v1, v2 with
+          | None, None -> None
+          | Some amap1, None -> Some amap1
+          | None, Some amap2 -> Some amap2
+          | Some _, Some _ -> error no_region "subtype_names: tyvar mapped twice" 
+        end arg_assign_map acc
+      in
+      let args = List.combine args1 args2 in
+      List.fold_right collect_assign_maps args IdMap.empty
+    | TyVar v1, TyVar v2 -> IdMap.singleton v1 v2
+    | TyConstr _, _ | _, TyConstr _ ->
+      error no_region "is_block_subtype: constrained type names encountered"
+    | _ -> error no_region "subtype_names: cannot unify type names"
   in
-  let subtype_vals (v1: value_type) (v2: value_type) = match (v1, v2) with
-  | I32Type, I32Type | I64Type, I64Type
-  | F32Type, F32Type | F64Type, F64Type -> true
-  | TyName n1, TyName n2
-    when get_tyname_constrs n1 = [] && get_tyname_constrs n2 = [] ->
-    let assign_map = subtype_names n1 n2 in
-    let (keys, elems) = IdMap.bindings assign_map |> List.split in
-    let constr_map1 = get_constr_map b1.constrs keys in
-    let constr_map2 = get_constr_map b2.constrs elems in
-    IdMap.for_all begin fun v1 v2 ->
-      let constrs1 = IdMap.find v1 constr_map1 in
-      let constrs2 = IdMap.find v2 constr_map2 in
-      let glb1 = find_greatest_subtype c constrs1 in
-      let glb2 = find_greatest_subtype c constrs2 in
-      is_class_subtype c glb1 glb2
-    end assign_map
-  | TyName n1, TyName n2
-    when not (get_tyname_constrs n1 = []) || not (get_tyname_constrs n2 = []) ->
-    error no_region "is_block_subtype: constrained type names encountered"
-  | _, _ -> false
+  (* check if two value types are subtypes of each othe
+   * for primitive integer types, this is just an equality check;
+   * for two type names, get an assignment map M from variables of v1 
+   * to variables of v2; for every mapping (a, b) in M, get all the subtyping
+   * constraints for variable a and variable b, find their greatest
+   * subtypes Ta and Tb, and then check Ta <: Tb
+   *)
+  let subtype_vals (v1: value_type) (v2: value_type) =
+    match (v1, v2) with
+    | I32Type, I32Type | I64Type, I64Type
+    | F32Type, F32Type | F64Type, F64Type -> true
+    | TyName n1, TyName n2
+      when get_tyname_constrs n1 = [] && get_tyname_constrs n2 = [] ->
+      let assign_map = subtype_names n1 n2 in
+      let (keys, elems) = IdMap.bindings assign_map |> List.split in
+      let constr_map1 = get_constr_map b1.constrs keys in
+      let constr_map2 = get_constr_map b2.constrs elems in
+      IdMap.for_all begin fun v1 v2 ->
+        let constrs1 = IdMap.find v1 constr_map1 in
+        let constrs2 = IdMap.find v2 constr_map2 in
+        let glb1 = find_greatest_subtype c constrs1 in
+        let glb2 = find_greatest_subtype c constrs2 in
+        is_class_subtype c glb1 glb2
+      end assign_map
+    | TyName n1, TyName n2
+      when not (get_tyname_constrs n1 = []) || not (get_tyname_constrs n2 = []) ->
+      error no_region "is_block_subtype: constrained type names encountered"
+    | _, _ -> false
   in
   let (st1', st2') = truncate_stacks b1.stack b2.stack in
   List.combine st1' st2' |>
@@ -815,14 +821,15 @@ let resolve_memop_type (c: context) (constrs: ty_constr list)
     transform_value_type inv_repl_map offset_ty
 ;;
 
-let rec pop_stack ctx bconstrs elems s =
+let rec pop_stack (c: context) (bconstrs: ty_constr list) (elems: stack_type)
+                  (s: stack_type) : stack_type =
   let len_elems = List.length elems in
   let len_s = List.length s in
   if len_elems > len_s 
   then error no_region "pop_stack: stack is empty"
   else begin
     let types_match =
-      let elems_block = alpha_convert_bound_stack s elems |> stack_to_block_type in
+      let elems_block = alpha_convert_stack s elems |> stack_to_block_type in
       let elems_block' =
         { elems_block with constrs=bconstrs@elems_block.constrs }
       in
@@ -830,7 +837,7 @@ let rec pop_stack ctx bconstrs elems s =
       let s_block = stack_to_block_type s' in
       let s_block' = { s_block with constrs=bconstrs@s_block.constrs } in
       (* contravariance! need to query s <: elems instead of elems <: s *) 
-      is_block_subtype ctx s_block' elems_block'
+      is_block_subtype c s_block' elems_block'
     in
     if not types_match
     then error no_region "pop_stack: unexpected type"
@@ -984,7 +991,7 @@ type genmap = IdSet.t IdMap.t
 (* union value types together by creating fresh vars when necessary and mapping
  * fresh vars to old vars *)
 let generalize (st1: stack_type) (st2: stack_type) : stack_type * genmap =
-  let min_var = min (get_fresh_var st1) (get_fresh_var st2) in
+  let min_var = min (get_fresh_var_stack st1) (get_fresh_var_stack st2) in
   let fresh_var = ref min_var in
   let collect_genmaps genmap acc =
     IdMap.merge begin fun _ v1 v2 ->
@@ -1518,7 +1525,6 @@ let example_structs =
 let example_module : module_ =
   let body = [
     (* call point.getColor() *)
-
     (* load object ref twice; one of the object refs will be used as the
      * first argument to the function call *)
     GetLocal (Int32.of_int 0 @@ no_region)  @@ no_region;
