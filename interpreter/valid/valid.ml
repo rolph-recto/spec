@@ -858,8 +858,7 @@ let rec peek_stack n s =
   | _ -> error no_region "peek_stack: invalid index"
 ;;
 
-
-let check_instr_no_branch (c: context) (b: block_type) (e: instr) : block_type  =
+let check_instr_italx (c: context) (b: block_type) (e: instr) : block_type  =
   let sintr = Arrange.instr e |> Sexpr.to_string_mach 0 in
   let s = b.stack in
   Printf.printf "check_instr %s %s\n" sintr (string_of_block_type b);
@@ -983,7 +982,7 @@ let check_instr_no_branch (c: context) (b: block_type) (e: instr) : block_type  
 (* infer the (postcondition) stack type of the basic block by gluing together
  * the stack types of its instructions *)
 let infer_block_type (c: context) (pre: block_type) (b: basic_block) : block_type  =
-  List.fold_left (check_instr_no_branch c) pre b.instrs
+  List.fold_left (check_instr_italx c) pre b.instrs
 ;;
 
 type genmap = IdSet.t IdMap.t
