@@ -14,6 +14,23 @@ let last_block_id = -1
 let error = Invalid.error
 let require b at s = if not b then error at s
 
+module type TyconstrTheory = sig
+  (* given a tyvar's constraints, determine if it the variable is
+   * in this theory *)
+  val in_theory : ty_constr list -> bool
+
+  (* instantiate tyvar into the most accurate concrete name possible
+   * this is used for determining which type name's structural type to retrieve
+   * during memory operations (load/store) *)
+  val instantiate_tyvar : ty_var -> ty_constr list -> ty_name
+
+  (* computes a new constraint given a set of constraints for old vars to which
+   * the fresh var is mapped *)
+  val factorization_constr_resolver : ty_var -> ty_constr list -> ty_constr
+
+  (* check if an assignment of a tyvar to another tyvar is permissible *)
+  val is_tyvar_subtype : ty_constr list -> ty_var -> ty_constr list -> ty_var -> bool
+end 
 
 (* Context *)
 type context =
@@ -26,21 +43,19 @@ type context =
   locals : value_type list;
   results : value_type list;
   labels : stack_type list;
-  (* a toposorted list (wrt inheritance) of classes; this is used by the
-   * resolver to compute to compute the least supertype of a given set of
-   * class upper-bounds  *)
-  class_hierarchy : (ty_atom * ty_atom) list;
   (* a map from type names to structures
    * we parametrize tyname structures so that we can replace these
    * with subclass names / type variables if needed *)
-  tyname_structs: tyname_struct TynameMap.t
+  tyname_structs: tyname_struct TynameMap.t;
+  (* constraint theories *)
+  theories: (module TyconstrTheory) list
 }
 
 let empty_context =
   { types = []; funcs = []; tables = []; memories = [];
     globals = []; locals = []; results = []; labels = [];
-    class_hierarchy = [];
     tyname_structs = TynameMap.empty;
+    theories = [];
   }
 
 let lookup category list x =
@@ -364,7 +379,7 @@ let print_cfg (cfg: cfg) =
     Printf.printf "basic block %d => basic block %d\n" s t;
   end cfg.edges
 
-(* REGION: CFG computation *)
+(* CFG computation *)
 
 (* create tree of basic blocks *)
 let create_bb_tree (is: instr list) : bb_node list =
@@ -641,7 +656,7 @@ let create_cfg (bbs: bb_node list) : cfg =
     end
 ;;
 
-(* REGION: type inference  *)
+(* type inference  *)
 
 (* some changes:
     - locals need to be able to change types if they are to have types that are
@@ -668,47 +683,17 @@ let set_local n t s =
   Lib.List.replace local_ind t s
 ;;
 
-let rec is_class_subtype (c: context) (cls1: ty_atom) (cls2: ty_atom) : bool =
-  if cls1 = cls2
-  then true
-  else begin
-    try begin
-      let is_child (parent, child) = child = cls1 in
-      let cls1' = List.find is_child c.class_hierarchy |> fst in
-      is_class_subtype c cls1' cls2
-    end with _ -> false
-  end
-;;
-
-let find_least_supertype (c: context) (bounds: ty_atom list) : ty_atom =
-  let supertype_of_all cls =
-    List.for_all (fun cls2 -> is_class_subtype c cls2 cls) bounds
-  in
-  try begin
-    List.find supertype_of_all bounds
-  end with _ -> error no_region "find_least_supertype: bounds don't have LUB!"
-;;
-
-let find_greatest_subtype (c: context) (bounds: ty_atom list) : ty_atom =
-  let subtype_of_all cls =
-    List.for_all (fun cls2 -> is_class_subtype c cls cls2) bounds
-  in
-  try begin
-    List.find subtype_of_all bounds 
-  end with _ -> error no_region "find_greatest_subtype: bounds don't have GLB!"
-;;
-
-let get_var_constrs (constrs: ty_constr list) (var: ty_var) : ty_atom list =
+let get_var_constrs (constrs: ty_constr list) (var: ty_var) : ty_constr list =
   List.map begin fun cons ->
     match cons with
-    | Subtype (svar, cls) when svar = var -> [cls]
+    | Subtype (svar, cls) when svar = var -> [cons]
     | _ -> []
   end constrs
   |> List.concat
 ;;
 
 let get_constr_map (constrs: ty_constr list) (vars: ty_var list)
-                   : (ty_atom list) IdMap.t =
+                   : (ty_constr list) IdMap.t =
   let build_constr_map var acc =
     let var_constrs = get_var_constrs constrs var in
     IdMap.add var var_constrs acc
@@ -756,12 +741,21 @@ let is_block_subtype (c: context) (b1: block_type) (b2: block_type) : bool =
       let (keys, elems) = IdMap.bindings assign_map |> List.split in
       let constr_map1 = get_constr_map b1.constrs keys in
       let constr_map2 = get_constr_map b2.constrs elems in
+
+      (* this can be parametrized depending on the "theory" of constraints;
+       * for example, in the theory of class subtyping we find the greatest
+       * subtypes for the variables and we check if these are subtypes *)
       IdMap.for_all begin fun v1 v2 ->
         let constrs1 = IdMap.find v1 constr_map1 in
         let constrs2 = IdMap.find v2 constr_map2 in
-        let glb1 = find_greatest_subtype c constrs1 in
-        let glb2 = find_greatest_subtype c constrs2 in
-        is_class_subtype c glb1 glb2
+        let theory =
+          List.find begin fun theory -> 
+            let module Theory = (val theory : TyconstrTheory) in
+            Theory.in_theory constrs1 && Theory.in_theory constrs2
+          end c.theories
+        in
+        let module Theory = (val theory: TyconstrTheory) in
+        Theory.is_tyvar_subtype constrs1 v1 constrs2 v2
       end assign_map
     | TyName n1, TyName n2
       when not (get_tyname_constrs n1 = []) || not (get_tyname_constrs n2 = []) ->
@@ -799,11 +793,15 @@ let resolve_memop_type (c: context) (constrs: ty_constr list)
      * i.e. greatest subtype of tyvar constraints *)  
     let tyvars = get_tyvars_tyname tyname in
     let constr_map = get_constr_map constrs tyvars in
-    let get_var_subst var_constrs = 
-      let glb = find_greatest_subtype c var_constrs in
-      TyAtom glb
+    let get_var_subst var var_constrs = 
+      let theory = List.find begin fun theory ->
+        let module Theory = (val theory : TyconstrTheory) in
+        Theory.in_theory var_constrs
+      end c.theories in
+      let module Theory = (val theory : TyconstrTheory) in
+      Theory.instantiate_tyvar var var_constrs
     in
-    let repl_map = IdMap.map get_var_subst constr_map in
+    let repl_map = IdMap.mapi get_var_subst constr_map in
     let name_no_constr = subst_tyname repl_map tyname in
     let ts = TynameMap.find name_no_constr c.tyname_structs in
     (* for now, we assume offsets are multiples of 4 *)
@@ -821,7 +819,7 @@ let resolve_memop_type (c: context) (constrs: ty_constr list)
     transform_value_type inv_repl_map offset_ty
 ;;
 
-let rec pop_stack (c: context) (bconstrs: ty_constr list) (elems: stack_type)
+let pop_stack (c: context) (bconstrs: ty_constr list) (elems: stack_type)
                   (s: stack_type) : stack_type =
   let len_elems = List.length elems in
   let len_s = List.length s in
@@ -1048,7 +1046,7 @@ let generalize (st1: stack_type) (st2: stack_type) : stack_type * genmap =
   (st', genmap)
 ;;
 
-(* create equiv classes of fresh vars and combine new constraints for them
+(* create equiv classes of fresh vars and combine new constraints for them;
  * this function takes in a constraint resolver to compute the new constraint
  * given a set of constraints for old_vars to which the fresh var is mapped *)
 let factorize (constrs: ty_constr list) (st: stack_type) (genmap: genmap)
@@ -1112,14 +1110,6 @@ let factorize (constrs: ty_constr list) (st: stack_type) (genmap: genmap)
   { constrs = repr_constrs @ constrs; stack = st' }
 ;;
 
-let build_resolver (f: ty_atom list -> ty_atom)
-                   (repr: ty_var) (constrs: ty_constr list) : ty_constr =
-  let new_constr =
-    List.map (fun (Subtype (_, bound)) -> bound) constrs |> f
-  in
-  Subtype (repr, new_constr)
-;;
-
 let compute_block_join (c: context) (bt1: block_type) (bt2: block_type)
                        : (block_type * bool) =
   let (st1', st2') = truncate_stacks bt1.stack bt2.stack in
@@ -1130,11 +1120,16 @@ let compute_block_join (c: context) (bt1: block_type) (bt2: block_type)
     let s  = ConstrSet.union s1 s2 in
     ConstrSet.elements s
   in
-  (* this resolver is not tied to a specific constraint "theory";
-   * as long as you can build this for your constraints, then
-   * the constraints can be used *)
-  let resolver = build_resolver (find_least_supertype c) in
-  let bt' = factorize constrs' st' genmap resolver in
+  (* this dispatches to the correct theory's resolver *)
+  let mapping_resolver repr_var constrs =
+    let theory = List.find begin fun theory ->
+      let module Theory = (val theory : TyconstrTheory) in
+      Theory.in_theory constrs
+    end c.theories in
+    let module Theory = (val theory : TyconstrTheory) in
+    Theory.factorization_constr_resolver repr_var constrs
+  in 
+  let bt' = factorize constrs' st' genmap mapping_resolver in
   let block_same = is_block_equiv bt' bt1 in
   (bt', block_same)
 ;;
@@ -1343,7 +1338,7 @@ let check_export (c : context) (set : NameSet.t) (ex : export) : NameSet.t =
 let check_module (m : module_) =
   let
     { types; imports; tables; memories; globals; funcs; start; elems; data;
-      exports; class_hierarchy; tyname_structs } = m.it
+      exports; tyname_structs } = m.it
   in
   let c0 =
     List.fold_right check_import imports
@@ -1354,7 +1349,7 @@ let check_module (m : module_) =
       funcs = c0.funcs @ List.map (fun f -> type_ c0 f.it.ftype) funcs;
       tables = c0.tables @ List.map (fun tab -> tab.it.ttype) tables;
       memories = c0.memories @ List.map (fun mem -> mem.it.mtype) memories;
-      class_hierarchy = class_hierarchy; tyname_structs = tyname_structs;
+      tyname_structs = tyname_structs;
     }
   in
   let c =
@@ -1374,6 +1369,79 @@ let check_module (m : module_) =
   require (List.length c.memories <= 1) m.at
     "multiple memories are not allowed (yet)"
 ;;
+
+(* constraint theory for class subtyping *)
+module ClassTheory : TyconstrTheory = struct
+  type class_hierarchy = (ty_atom * ty_atom) list
+
+  (* a toposorted list (wrt inheritance) of classes; this is used by the
+   * resolver to compute to compute the least supertype of a given set of
+   * class upper-bounds  *)
+  let hierarchy = [
+    ("Object", "Point");
+    ("Point", "Point3D");
+    ("Object", "RGB");
+  ];;
+
+  let rec is_class_subtype (cls1: ty_atom) (cls2: ty_atom) : bool =
+    if cls1 = cls2
+    then true
+    else begin
+      try begin
+        let is_child (parent, child) = child = cls1 in
+        let cls1' = List.find is_child hierarchy |> fst in
+        is_class_subtype cls1' cls2
+      end with _ -> false
+    end
+  ;;
+
+  let find_least_supertype (bounds: ty_atom list) : ty_atom =
+    let supertype_of_all cls =
+      List.for_all (fun cls2 -> is_class_subtype cls2 cls) bounds
+    in
+    try begin
+      List.find supertype_of_all bounds
+    end with _ -> error no_region "find_least_supertype: bounds don't have LUB!"
+  ;;
+
+  let find_greatest_subtype (bounds: ty_atom list) : ty_atom =
+    let subtype_of_all cls =
+      List.for_all (fun cls2 -> is_class_subtype cls cls2) bounds
+    in
+    try begin
+      List.find subtype_of_all bounds 
+    end with _ -> error no_region "find_greatest_subtype: bounds don't have GLB!"
+  ;;
+
+  let in_theory (constrs: ty_constr list) =
+    List.exists begin fun constr ->
+      match constr with
+      | Subtype _ -> true
+      | _ -> false
+    end constrs
+  ;;
+
+  let instantiate_tyvar (v: ty_var) (constrs: ty_constr list) : ty_name =
+    let bounds = List.map (fun (Subtype (_, bound)) -> bound) constrs in
+    let glb = find_greatest_subtype bounds in
+    TyAtom glb
+  ;;
+
+  let factorization_constr_resolver (repr: ty_var) (constrs: ty_constr list) : ty_constr =
+    let bounds = List.map (fun (Subtype (_, bound)) -> bound) constrs in
+    let new_bound = find_least_supertype bounds in
+    Subtype (repr, new_bound)
+  ;;
+
+  let is_tyvar_subtype (constrs1: ty_constr list) (var1: ty_var)
+                       (constrs2: ty_constr list) (var2 : ty_var) =
+    let bounds1 = List.map (fun (Subtype (_, bound)) -> bound) constrs1 in
+    let bounds2 = List.map (fun (Subtype (_, bound)) -> bound) constrs2 in
+    let glb1 = find_greatest_subtype bounds1 in
+    let glb2 = find_greatest_subtype bounds2 in
+    is_class_subtype glb1 glb2
+  ;;
+end
 
 let check_func_italx (c : context) (f : func) =
   let {ftype; locals; body} = f.it in
@@ -1409,7 +1477,7 @@ let check_func_italx (c : context) (f : func) =
 let check_module_italx (m : module_) =
   let
     { types; imports; tables; memories; globals; funcs; start; elems; data;
-      exports; class_hierarchy; tyname_structs } = m.it
+      exports; tyname_structs } = m.it
   in
   let c0 =
     List.fold_right check_import imports
@@ -1420,7 +1488,8 @@ let check_module_italx (m : module_) =
       funcs = c0.funcs @ List.map (fun f -> type_ c0 f.it.ftype) funcs;
       tables = c0.tables @ List.map (fun tab -> tab.it.ttype) tables;
       memories = c0.memories @ List.map (fun mem -> mem.it.mtype) memories;
-      class_hierarchy = class_hierarchy; tyname_structs = tyname_structs;
+      tyname_structs = tyname_structs;
+      theories = [(module ClassTheory: TyconstrTheory)];
     }
   in
   let c =
@@ -1433,12 +1502,6 @@ let (<<) v a = Subtype (v, a)
 let tyfunc f args = TyFunc (f, args)
 let var v = TyVar v
 let tyconstr constrs tyname = TyConstr (constrs, tyname)
-
-let example_hierarchy = [
-  ("Object", "Point");
-  ("Point", "Point3D");
-  ("Object", "RGB");
-];;
 
 let point_struct =
 [
@@ -1557,7 +1620,7 @@ let example_module : module_ =
     tables=[{ ttype=TableType ({min=Int32.of_int 0;max=None}, AnyFuncType) } @@ no_region]; 
     memories=[{ mtype=MemoryType { min=Int32.of_int 0; max=None } } @@ no_region]; 
     start=None; elems=[]; data=[]; imports=[]; exports=[];
-    class_hierarchy=example_hierarchy; tyname_structs=example_structs;
+    tyname_structs=example_structs;
   } @@ no_region
 ;;
 

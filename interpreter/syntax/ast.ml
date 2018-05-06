@@ -191,7 +191,6 @@ and module_' =
   data : string segment list;
   imports : import list;
   exports : export list;
-  class_hierarchy : (ty_atom * ty_atom) list;
   tyname_structs: tyname_struct TynameMap.t;
 }
 
@@ -210,7 +209,6 @@ let empty_module =
   data = [];
   imports = [];
   exports = [];
-  class_hierarchy = [];
   tyname_structs = TynameMap.empty;
 }
 

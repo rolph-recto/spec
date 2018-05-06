@@ -660,11 +660,10 @@ let module_ s =
     List.map2 Source.(fun t f -> {f.it with ftype = t} @@ f.at)
       func_types func_bodies
   in
-  let class_hierarchy = [] in
   let tyname_structs = TynameMap.empty in
   {
     types; tables; memories; globals; funcs; imports; exports; elems;
-    data; start; class_hierarchy; tyname_structs;
+    data; start; tyname_structs;
   }
 
 
